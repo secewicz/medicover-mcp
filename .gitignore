@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Local credential store (never commit refresh tokens)
+credentials.json
+*.credentials.json
+
+# Capture artifacts (live tokens + medical data — see capture/.gitignore)
+capture/flows.mitm
+capture/chrome-profile/
+*.mitm

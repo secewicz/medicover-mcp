@@ -1,0 +1,32 @@
+[project]
+name = "medicover-mcp"
+version = "0.1.0"
+description = "MCP server for the Medicover OnLine24 patient portal (appointments, slots, booking)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+]
+
+[project.scripts]
+medicover-auth = "medicover_mcp.cli:main"
+medicover-mcp = "medicover_mcp.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/medicover_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

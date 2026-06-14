@@ -1,0 +1,4 @@
+# Sensitive: live session tokens + personal/medical data. Never commit.
+chrome-profile/
+flows.mitm
+*.mitm
