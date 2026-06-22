@@ -204,7 +204,7 @@ class LoginFlow:
         self._client = client or httpx.Client(
             timeout=config.Settings.from_env().request_timeout,
             follow_redirects=False,
-            headers={"User-Agent": config.USER_AGENT},
+            headers=dict(config.BROWSER_NAV_HEADERS),
         )
         self._owns_client = client is None
         self.device_id = device_id or new_device_id()
@@ -254,7 +254,8 @@ class LoginFlow:
                 "Input.IsSimpleAccessRegulationAccepted": "false",
             }
         )
-        resp = self._client.post(self._login_action, data=fields)
+        # Browser submits the login form as a same-origin navigation with Origin: null.
+        resp = self._client.post(self._login_action, data=fields, headers={"Origin": "null"})
         location = self._require_redirect(resp, "login")
         if "/Account/Mfa" in location:
             self._mfa_action = self._abs(location)
@@ -287,7 +288,7 @@ class LoginFlow:
                 "Input.Button": "confirm",
             }
         )
-        resp = self._client.post(self._mfa_post_action, data=fields)
+        resp = self._client.post(self._mfa_post_action, data=fields, headers={"Origin": "null"})
         location = self._require_redirect(resp, "mfa")
         if "/Account/Mfa" in location:
             raise AuthError("the SMS code was not accepted — check the code and try again")

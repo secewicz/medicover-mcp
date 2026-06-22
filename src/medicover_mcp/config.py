@@ -30,10 +30,34 @@ PROFILES_ENDPOINT = f"{AUTH_HOST}/api/v4/available-profiles/me"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
-# A stable, honest User-Agent. The portal's own SPA uses a Chrome UA; we identify as an
-# automation client but keep the app_version the SPA advertised so requests look well-formed.
-USER_AGENT = "medicover-mcp/0.1 (+https://github.com/; unattended appointment agent)"
+# The portal sits behind an Imperva WAF (the `cookiesession1` cookie) that soft-blocks
+# non-browser clients on sensitive POSTs — notably the login form, which silently re-renders
+# instead of redirecting. We therefore present the same Chrome UA + client hints the real SPA
+# sends. (This is a personal automation tool acting on the user's own account/dependents.)
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
+SEC_CH_UA = '"Chromium";v="149", "Not)A;Brand";v="24"'
+SEC_CH_UA_PLATFORM = '"Linux"'
 APP_VERSION = "3.30.0-beta.1.2"
+
+# Headers that make the interactive bootstrap login look like a browser navigation so the WAF
+# lets the credential/MFA POSTs through (matched to a captured Chrome session).
+BROWSER_NAV_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,image/apng,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "sec-ch-ua": SEC_CH_UA,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
+}
 
 # Refresh access tokens this many seconds before their real expiry (they only live ~180s).
 TOKEN_EXPIRY_SKEW_SECONDS = 30

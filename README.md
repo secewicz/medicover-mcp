@@ -14,7 +14,7 @@ an existing appointment to an earlier one — including for linked dependents (e
 |------|---------|
 | `list_patients` | The account holder + linked dependents, each with a stable `patient_id` (MRN). |
 | `list_appointments` | A patient's planned/past appointments (read-only). |
-| `search_slots` | Available slots by region + specialty (optionally doctor/clinic/date). |
+| `search_slots` | Available slots by region + specialty (optionally doctor/clinic/language, date range, and slot-search type e.g. `DiagnosticProcedure`). Each slot reports its `visit_type` (Center/Phone/PhoneAdvice). |
 | `book_appointment` | Book a slot for a patient — `patient_id` **required**. |
 | `reschedule_appointment` | Move an appointment to another slot; "earlier-only" by default. |
 | `list_appointment_filters` | Resolve specialty/doctor/clinic/region **names → IDs** from history. |

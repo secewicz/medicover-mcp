@@ -193,7 +193,31 @@ visits — handy for `list_appointments` filtering.
 ### Search slots — `GET /appointments/api/v2/search-appointments/slots`
 Query: `RegionIds` (repeatable, required), `SpecialtyIds` (repeatable, required),
 `SlotSearchType=Standard`, `StartTime=YYYY-MM-DD` (search-from date), `Page`, `PageSize`,
-optional `DoctorIds`, `ClinicIds`, `DoctorLanguageIds`, `isOverbookingSearchDisabled=false`.
+optional `DoctorIds`, `ClinicIds`, `DoctorLanguageIds`, `VisitType`,
+`isOverbookingSearchDisabled=false`.
+
+**Corroborated against `rafsaf/medichaser`** (independent, current implementation):
+- `SlotSearchType` is **not a fixed constant** — medichaser defaults it to integer `0` and
+  exposes other categories, notably `DiagnosticProcedure`. Our capture only ever showed
+  `"Standard"`; both the string `"Standard"` and `0` appear to denote the default category.
+  We surface it as a parameter (`slot_search_type`, default `"Standard"`) so diagnostic
+  procedures can be searched.
+- `VisitType`: medichaser sends it (pinned to `"Center"`), **but the official SPA does not** —
+  the second capture's slot searches (incl. the one that led to a real booking) carry **no
+  `VisitType` param at all**, even for an in-person booking. In-person vs. tele is expressed by
+  **specialty choice** (e.g. `158`/`7340` are in-center pediatrics; `19048` is tele) and read
+  back from each slot's `visitType`. We therefore **do not send `VisitType`** (matching the
+  SPA); callers filter returned slots by `visit_type` instead. (Verified: `capture/flows.mitm`
+  session 2, 2026-06-17.)
+- There is **no end-date query param**; medichaser filters by `appointmentDate` client-side
+  after the call. We do the same for the optional `end_date`.
+- Note: medichaser hits the **unversioned** path (`/appointments/api/search-appointments/…`,
+  no `/v2/`). We use `/v2/` (what the captured SPA used). Both appear to coexist; the
+  unversioned path is a known-good fallback if a `/v2/` route ever 404s.
+
+medichaser does **not** book, reschedule, or handle subaccounts/dependents — so it offers no
+corroboration for our `book_appointment` / `reschedule_appointment` / token-exchange paths;
+those remain validated only against this single capture.
 Response:
 ```json
 {"additionalFilters":{"doctors":[…],"clinics":[…]},
@@ -216,17 +240,18 @@ re-search right before booking).
  "metadata":{"appointmentSource":"Direct"}}
 → 200 {"appointmentId": 600299524}
 ```
-`reportingId`: **whether this field is required is unverified.** What the capture shows:
-both bookings sent a non-empty `reportingId`; both were preceded by the service-selector/
-**triage** (symptom-checker) flow (`/service-selector-configurator-os/.../triage/flat`), which
-is **out of scope**; and the exact value sent at booking appears in *no* captured response (it
-only shares a per-user prefix with the triage `reportingId` and the encoded appointment IDs).
-We never observed a booking with an empty/absent `reportingId`, so we cannot confirm it is
-optional. Booking is fundamentally keyed by `bookingString`, and the in-scope "search → book"
-path has no legitimate source for a `reportingId`, so the server **defaults it to an empty
-string** and always sends `metadata.appointmentSource:"Direct"`. **Risk:** if the API in fact
-requires a valid `reportingId`, `book_appointment` will fail at booking time with a clear API
-error — this could not be tested without performing a real booking.
+`reportingId`: **the SPA always sends a non-empty value, sourced from the triage flow.**
+Confirmed in `capture/flows.mitm` session 2 (2026-06-17, a real booking): the 86-char
+`reportingId` in the `book-appointment` body is returned verbatim by
+`GET /service-selector-configurator-os/api/keywords/{keywordId}/triage/flat` (the
+symptom-checker / service-selector), which runs **before** the slot search and is **out of
+scope** for this server. No booking with an empty/absent `reportingId` has ever been observed,
+so whether `""` is *accepted* remains untested — but it is now certain the official client
+never books without one. Booking is keyed by `bookingString`; the in-scope "search → book" path
+has no legitimate source for a `reportingId`, so the server **defaults it to an empty string**
+and always sends `metadata.appointmentSource:"Direct"`. **Risk (now the single biggest live
+unknown):** if the API requires a valid `reportingId`, `book_appointment` fails with a clear API
+error. Closing this would mean implementing the triage call to mint a `reportingId` per slot.
 
 ### Reschedule — `POST /appointments/api/v2/person-appointments/reschedule-appointment`
 ```json
@@ -249,7 +274,10 @@ Exists, but **deliberately not exposed** (no cancel-without-rebook in scope).
   Paediatrician`, `88 Allergologist Paediatrician`, `19046 Internal medicine – phone advice`.
 - `AppointmentState`: `Planned | Past | All`.
 - `visitType` / consultation type: `Center | Phone | PhoneAdvice | All`.
-- `SlotSearchType`: `Standard`.
+- `SlotSearchType`: `Standard` (default; `0` in medichaser), `DiagnosticProcedure`, … —
+  configurable, not exhaustive.
+- `DoctorLanguageIds` (from medichaser): `4 = Polski`, `6 = Angielski`, `60 = Ukraiński`.
+  Not exhaustive — resolve others via the `filters` endpoint.
 - Patients (this account): holder `2220055`; dependents `2098443`, `3914784`.
 
 All specialty/clinic/doctor/region IDs are opaque integers — resolve them via the `filters`

@@ -127,6 +127,11 @@ async def list_search_filters(
     doctor_ids: Annotated[
         list[str] | None, Field(description="Optional doctor IDs to narrow the result.")
     ] = None,
+    slot_search_type: Annotated[
+        str,
+        Field(description="Match the search_slots value: 'Standard' (default) or "
+                          "'DiagnosticProcedure'."),
+    ] = "Standard",
 ) -> models.FilterOptions:
     """List the clinics, doctors and languages bookable for a region + specialty selection.
 
@@ -139,6 +144,7 @@ async def list_search_filters(
             region_ids=region_ids,
             specialty_ids=specialty_ids,
             doctor_ids=doctor_ids,
+            slot_search_type=slot_search_type,
         )
         return models.FilterOptions(
             specialties=models.to_named_refs(data.get("specialties", []), name_key="value"),
@@ -160,24 +166,39 @@ async def search_slots(
     start_date: Annotated[
         str, Field(description="Earliest date to search from, YYYY-MM-DD.")
     ],
+    end_date: Annotated[
+        str | None,
+        Field(description="Optional latest date (YYYY-MM-DD). Slots after this date are "
+                          "dropped client-side (the portal only honours a start date)."),
+    ] = None,
     patient_id: Annotated[
         int | None, Field(description="MRN; defaults to the account holder.")
     ] = None,
     doctor_ids: Annotated[list[str] | None, Field(description="Optional doctor IDs.")] = None,
     clinic_ids: Annotated[list[str] | None, Field(description="Optional clinic IDs.")] = None,
     language_ids: Annotated[
-        list[str] | None, Field(description="Optional doctor-language IDs.")
+        list[str] | None,
+        Field(description="Optional doctor-language IDs (e.g. 4=Polski, 6=Angielski, "
+                          "60=Ukraiński; resolve others via list_search_filters)."),
     ] = None,
+    slot_search_type: Annotated[
+        str,
+        Field(description="Slot category. 'Standard' (default) for normal consultations; "
+                          "'DiagnosticProcedure' for diagnostic procedures."),
+    ] = "Standard",
 ) -> models.SlotSearchResult:
     """Find available appointment slots for a specialty/region (optionally doctor/clinic).
 
     Each returned slot carries a `booking_string` — the single-use handle you pass to
-    book_appointment or reschedule_appointment. `next_search_date` hints the StartTime to use
-    to page further into the future. Re-run this immediately before booking, because a
-    booking_string can expire. Read-only.
+    book_appointment or reschedule_appointment, and a `visit_type` (Center | Phone |
+    PhoneAdvice). The portal has no visit-type search filter, so to get in-person ("Center")
+    visits, choose an in-person specialty and/or filter the returned slots by `visit_type`.
+    `next_search_date` hints the StartTime to use to page further into the future. Re-run this
+    immediately before booking, because a booking_string can expire. Read-only.
     """
     try:
         sd = models.normalize_date(start_date)
+        ed = models.normalize_date(end_date) if end_date else None
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
     try:
@@ -189,10 +210,13 @@ async def search_slots(
             doctor_ids=doctor_ids,
             clinic_ids=clinic_ids,
             language_ids=language_ids,
+            slot_search_type=slot_search_type,
         )
         slots = [models.Slot.from_item(it) for it in data.get("items", [])]
+        if ed is not None:
+            slots = [s for s in slots if s.date[:10] <= ed]
         return models.SlotSearchResult(
-            count=data.get("count", len(slots)),
+            count=len(slots) if ed is not None else data.get("count", len(slots)),
             next_search_date=data.get("nextSearchDate"),
             slots=slots,
         )

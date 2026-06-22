@@ -11,13 +11,15 @@ are never written to disk or logged — only the resulting refresh token is pers
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
+import json
 import sys
 
 import httpx
 
-from . import config
-from .auth import AuthError, LoginFlow, jwt_expiry
+from . import auth, config
+from .auth import AuthError, LoginFlow, jwt_expiry, new_device_id
 from .store import CredentialStore, StoredCredentials
 
 
@@ -71,6 +73,88 @@ def cmd_login(settings: config.Settings) -> int:
     return 0
 
 
+def _extract_refresh_token(pasted: str) -> str | None:
+    """Accept either a raw refresh token or the browser's `oidc.user:...` JSON blob."""
+    pasted = pasted.strip()
+    if not pasted:
+        return None
+    if pasted.startswith("{"):
+        try:
+            return json.loads(pasted).get("refresh_token")
+        except ValueError:
+            return None
+    return pasted
+
+
+def _jwt_sub(token: str) -> int | None:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        sub = json.loads(base64.urlsafe_b64decode(payload)).get("sub")
+        return int(sub) if sub is not None else None
+    except Exception:
+        return None
+
+
+def cmd_set_token(settings: config.Settings) -> int:
+    """Bootstrap by pasting a refresh token captured from a logged-in browser session.
+
+    Get it from your browser's devtools while logged in to online24.medicover.pl:
+    Application -> Local/Session Storage -> the `oidc.user:...` entry -> copy `refresh_token`
+    (or paste the whole JSON value). NB: the refresh token rotates on use, so do this promptly.
+    """
+    store = CredentialStore(settings.store_path)
+    _eprint(
+        "Paste your refresh token (or the whole `oidc.user:...` JSON from the browser's\n"
+        "Local/Session Storage), then press Enter. Input is hidden:"
+    )
+    rt = _extract_refresh_token(getpass.getpass(""))
+    if not rt:
+        _eprint("error: no refresh token found in input")
+        return 2
+
+    # Validate immediately by refreshing once. This confirms the token, captures the ROTATED
+    # token (so we own the chain henceforth), and derives the holder MRN.
+    try:
+        with httpx.Client(
+            timeout=settings.request_timeout, headers={"User-Agent": config.USER_AGENT}
+        ) as c:
+            resp = c.post(
+                config.TOKEN_ENDPOINT,
+                data=auth.build_refresh_request(rt),
+                headers={"Accept": "application/json"},
+            )
+        tokens = auth.parse_token_response(resp)
+    except AuthError as exc:
+        _eprint(f"Refresh token rejected: {exc}")
+        _eprint(
+            "It may have already rotated in your browser (the SPA refreshes every few "
+            "minutes). Grab a fresh one and paste it promptly."
+        )
+        return 1
+    except httpx.HTTPError as exc:
+        _eprint(f"Network error talking to Medicover: {exc}")
+        return 1
+
+    if not tokens.refresh_token:
+        _eprint("warning: no rotated refresh token returned; unattended runtime will not work")
+        return 1
+    holder_mrn = _jwt_sub(tokens.access_token)
+    store.save(
+        StoredCredentials(
+            refresh_token=tokens.refresh_token,
+            device_id=new_device_id(),
+            holder_mrn=holder_mrn,
+        )
+    )
+    _eprint(f"Saved to {store.path} (mode 0600). Authenticated as MRN {holder_mrn}.")
+    _eprint(
+        "Note: the refresh token rotated to this tool, so your browser tab will be logged "
+        "out on its next refresh — that's expected."
+    )
+    return 0
+
+
 def cmd_status(settings: config.Settings) -> int:
     store = CredentialStore(settings.store_path)
     if not store.exists():
@@ -102,6 +186,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="medicover-auth", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("login", help="interactive login + SMS 2FA; persist the refresh token")
+    sub.add_parser(
+        "set-token",
+        help="bootstrap by pasting a refresh token from a logged-in browser session",
+    )
     sub.add_parser("status", help="show whether credentials are stored (no secrets shown)")
     sub.add_parser("logout", help="delete the stored credentials")
     args = parser.parse_args(argv)
@@ -109,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     settings = config.Settings.from_env()
     if args.command == "login":
         return cmd_login(settings)
+    if args.command == "set-token":
+        return cmd_set_token(settings)
     if args.command == "status":
         return cmd_status(settings)
     if args.command == "logout":

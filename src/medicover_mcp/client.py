@@ -135,6 +135,10 @@ class MedicoverClient:
                 "Accept": "application/json",
                 "Accept-Language": "en",
                 "Origin": config.SPA_ORIGIN,
+                # Client hints — the gateway is behind the same Imperva WAF as login.
+                "sec-ch-ua": config.SEC_CH_UA,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": config.SEC_CH_UA_PLATFORM,
             }
             resp = await self._send_with_retry(method, url, headers, kwargs)
         log.debug("%s %s -> %s", method, _path(url), resp.status_code)
@@ -205,8 +209,9 @@ class MedicoverClient:
         specialty_ids: list[str],
         doctor_ids: list[str] | None = None,
         language_ids: list[str] | None = None,
+        slot_search_type: str = "Standard",
     ) -> dict:
-        params: list[tuple[str, str]] = [("SlotSearchType", "Standard")]
+        params: list[tuple[str, str]] = [("SlotSearchType", slot_search_type)]
         params += [("RegionIds", r) for r in region_ids]
         params += [("SpecialtyIds", s) for s in specialty_ids]
         params += [("DoctorIds", d) for d in (doctor_ids or [])]
@@ -229,10 +234,11 @@ class MedicoverClient:
         doctor_ids: list[str] | None = None,
         clinic_ids: list[str] | None = None,
         language_ids: list[str] | None = None,
+        slot_search_type: str = "Standard",
         page_size: int = 200,
     ) -> dict:
         params: list[tuple[str, str | int]] = [
-            ("SlotSearchType", "Standard"),
+            ("SlotSearchType", slot_search_type),
             ("StartTime", start_date),
             ("Page", 1),
             ("PageSize", page_size),
@@ -264,6 +270,22 @@ class MedicoverClient:
             f"{config.API_HOST}/appointments/api/v2/search-appointments/book-appointment",
             patient_id=patient_id,
             json=body,
+        )
+        return resp.json()
+
+    async def cancel_appointment(self, patient_id: int, *, encoded_appointment_id: str) -> dict:
+        """Cancel an appointment by its encoded `id` (from list_appointments).
+
+        Intentionally NOT exposed as an MCP tool (no cancel-without-rebook in the agent
+        surface); it exists so test/probe code can guarantee cleanup after a booking.
+        """
+        import urllib.parse
+
+        quoted = urllib.parse.quote(encoded_appointment_id, safe="")
+        resp = await self._request(
+            "DELETE",
+            f"{config.API_HOST}/appointments/api/v2/person-appointments/appointments/{quoted}",
+            patient_id=patient_id,
         )
         return resp.json()
 

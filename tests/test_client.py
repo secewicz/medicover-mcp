@@ -94,6 +94,22 @@ async def test_search_slots_builds_repeated_query_params(store, settings):
     assert "RegionIds=204" in qs
     assert "DoctorIds=221808" in qs
     assert "StartTime=2026-06-15" in qs
+    assert "SlotSearchType=Standard" in qs
+    # The portal has no visit-type search filter; we never send one (verified against capture).
+    assert "VisitType" not in qs
+    await client.aclose()
+
+
+async def test_search_slots_passes_search_type(store, settings):
+    requests: list = []
+    client = build_client(store, settings, _record(requests))
+    await client.search_slots(
+        None, region_ids=["204"], specialty_ids=["9"], start_date="2026-06-15",
+        slot_search_type="DiagnosticProcedure",
+    )
+    slot_req = next(r for r in requests if r.url.path.endswith("/slots"))
+    qs = str(slot_req.url.query)
+    assert "SlotSearchType=DiagnosticProcedure" in qs
     await client.aclose()
 
 

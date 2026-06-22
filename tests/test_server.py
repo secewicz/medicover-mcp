@@ -25,6 +25,18 @@ class FakeClient:
     async def book_appointment(self, patient_id, *, booking_string, reporting_id=""):
         return {"appointmentId": 999}
 
+    async def search_slots(self, patient_id, **kwargs):
+        self.search_kwargs = kwargs
+        return {
+            "count": 3,
+            "nextSearchDate": None,
+            "items": [
+                {"bookingString": "B1", "appointmentDate": "2026-06-16T07:00:00"},
+                {"bookingString": "B2", "appointmentDate": "2026-06-18T09:00:00"},
+                {"bookingString": "B3", "appointmentDate": "2026-06-25T11:00:00"},
+            ],
+        }
+
 
 @pytest.fixture
 def fake_client(monkeypatch):
@@ -80,3 +92,21 @@ async def test_reschedule_later_allowed_when_override(fake_client):
         new_slot_date="2026-06-25T09:00:00", require_earlier=False,
     )
     assert result.rescheduled is True
+
+
+async def test_search_slots_end_date_filters_client_side(fake_client):
+    result = await server.search_slots(
+        region_ids=["204"], specialty_ids=["9"],
+        start_date="2026-06-16", end_date="2026-06-20",
+    )
+    # Only the two slots on/before 2026-06-20 survive; the 06-25 one is dropped.
+    assert result.count == 2
+    assert [s.booking_string for s in result.slots] == ["B1", "B2"]
+
+
+async def test_search_slots_forwards_search_type(fake_client):
+    await server.search_slots(
+        region_ids=["204"], specialty_ids=["9"], start_date="2026-06-16",
+        slot_search_type="DiagnosticProcedure",
+    )
+    assert fake_client.search_kwargs["slot_search_type"] == "DiagnosticProcedure"
