@@ -37,6 +37,17 @@ def _get_client() -> MedicoverClient:
     return _client
 
 
+def _require_confirmation(tool: str, confirm: bool) -> None:
+    """Write gate (fork change). The text starts with CONFIRMATION REQUIRED because the lab's
+    mcp-hub guard recognises that phrase and refunds the write-budget slot for such a reply."""
+    if confirm is not True:
+        raise RuntimeError(
+            f"CONFIRMATION REQUIRED: {tool} changes a real medical appointment. Show the human "
+            "the patient, doctor, clinic and time, and call again with confirm=true only after "
+            "they approve this exact change."
+        )
+
+
 def _friendly(exc: Exception) -> str:
     if isinstance(exc, (AuthError, CredentialError)):
         return f"Authentication problem: {exc}"
@@ -242,6 +253,11 @@ async def book_appointment(
                           "unverified (see NOTES.md); the in-scope search flow has no source "
                           "for one, so leave empty unless you captured a value."),
     ] = "",
+    confirm: Annotated[
+        bool,
+        Field(description="Must be true to actually book. Leave false until the human has "
+                          "approved this exact slot for this exact patient."),
+    ] = False,
 ) -> models.BookingResult:
     """Book an available slot for a specific patient.
 
@@ -253,6 +269,7 @@ async def book_appointment(
     captured bookings carried one from the out-of-scope triage flow); if booking fails citing
     it, that's the likely cause.
     """
+    _require_confirmation("book_appointment", confirm)
     try:
         result = await _get_client().book_appointment(
             patient_id, booking_string=booking_string, reporting_id=reporting_id
@@ -283,20 +300,20 @@ async def reschedule_appointment(
         Field(description="The new slot's datetime (ISO, as shown by search_slots). Used for "
                           "the earlier-only safety check and to report the move."),
     ],
-    require_earlier: Annotated[
+    confirm: Annotated[
         bool,
-        Field(description="If true (default), refuse the move unless the new slot is strictly "
-                          "earlier than the current appointment — for the 'find an earlier "
-                          "slot' use case."),
-    ] = True,
+        Field(description="Must be true to actually move the appointment. Leave false until "
+                          "the human has approved this exact move."),
+    ] = False,
 ) -> models.RescheduleResult:
-    """Move an existing appointment to a different slot (atomic; never cancels without rebooking).
+    """Move an existing appointment to a strictly EARLIER slot (atomic; never cancels).
 
-    Only moves to the slot you explicitly pass. With `require_earlier` (default), it first
-    confirms the new slot is strictly earlier than the current appointment and otherwise
-    refuses — so an unattended 'earlier slot' routine can't accidentally move an appointment
-    later. The portal re-validates the slot at reschedule time.
+    Only moves to the slot you explicitly pass, and only if it is strictly earlier than the
+    current appointment (fork change: the upstream `require_earlier=false` override is gone, so
+    an agent cannot move an appointment later). The portal re-validates the slot at
+    reschedule time.
     """
+    _require_confirmation("reschedule_appointment", confirm)
     client = _get_client()
     try:
         # Read-before-write: locate the current appointment to learn its date.
@@ -308,13 +325,12 @@ async def reschedule_appointment(
                 "appointment_id not found among this patient's planned appointments; "
                 "refusing to reschedule an unknown appointment"
             )
-        if require_earlier:
-            # ISO 8601 datetimes compare correctly as strings (same offset assumed).
-            if old_date is None or new_slot_date[:19] >= old_date[:19]:
-                raise RuntimeError(
-                    f"new slot {new_slot_date} is not strictly earlier than the current "
-                    f"appointment {old_date}; refusing (set require_earlier=false to override)"
-                )
+        # ISO 8601 datetimes compare correctly as strings (same offset assumed).
+        if old_date is None or new_slot_date[:19] >= old_date[:19]:
+            raise RuntimeError(
+                f"new slot {new_slot_date} is not strictly earlier than the current "
+                f"appointment {old_date}; refusing"
+            )
         result = await client.reschedule_appointment(
             patient_id,
             old_appointment_string=appointment_id,

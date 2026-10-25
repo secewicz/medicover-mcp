@@ -51,7 +51,7 @@ async def test_list_appointments_rejects_bad_state(fake_client):
 
 
 async def test_book_returns_appointment_id(fake_client):
-    result = await server.book_appointment(patient_id=2220055, booking_string="BSTR")
+    result = await server.book_appointment(patient_id=2220055, booking_string="BSTR", confirm=True)
     assert result.booked is True
     assert result.appointment_id == 999
 
@@ -61,7 +61,8 @@ async def test_reschedule_refuses_later_slot_when_earlier_required(fake_client):
     with pytest.raises(RuntimeError, match="not strictly earlier"):
         await server.reschedule_appointment(
             patient_id=2220055, appointment_id="APPT-1", booking_string="BSTR",
-            new_slot_date="2026-06-21T09:00:00", require_earlier=True,
+            new_slot_date="2026-06-21T09:00:00",
+            confirm=True,
         )
     assert fake_client.reschedule_called is False
 
@@ -69,7 +70,8 @@ async def test_reschedule_refuses_later_slot_when_earlier_required(fake_client):
 async def test_reschedule_allows_earlier_slot(fake_client):
     result = await server.reschedule_appointment(
         patient_id=2220055, appointment_id="APPT-1", booking_string="BSTR",
-        new_slot_date="2026-06-18T09:00:00", require_earlier=True,
+        new_slot_date="2026-06-18T09:00:00",
+            confirm=True,
     )
     assert result.rescheduled is True
     assert fake_client.reschedule_called is True
@@ -81,17 +83,39 @@ async def test_reschedule_rejects_unknown_appointment(fake_client):
     with pytest.raises(RuntimeError, match="not found"):
         await server.reschedule_appointment(
             patient_id=2220055, appointment_id="DOES-NOT-EXIST", booking_string="BSTR",
-            new_slot_date="2026-06-18T09:00:00",
+            new_slot_date="2026-06-18T09:00:00", confirm=True,
         )
     assert fake_client.reschedule_called is False
 
 
-async def test_reschedule_later_allowed_when_override(fake_client):
-    result = await server.reschedule_appointment(
-        patient_id=2220055, appointment_id="APPT-1", booking_string="BSTR",
-        new_slot_date="2026-06-25T09:00:00", require_earlier=False,
-    )
-    assert result.rescheduled is True
+async def test_reschedule_has_no_later_override(fake_client):
+    # The fork removed require_earlier: a later slot is always refused.
+    with pytest.raises(RuntimeError, match="not strictly earlier"):
+        await server.reschedule_appointment(
+            patient_id=2220055, appointment_id="APPT-1", booking_string="BSTR",
+            new_slot_date="2026-06-25T09:00:00", confirm=True,
+        )
+    assert fake_client.reschedule_called is False
+
+
+async def test_book_without_confirm_is_refused_and_does_not_call(fake_client, monkeypatch):
+    called = []
+    async def boom(*a, **k):
+        called.append(1)
+    monkeypatch.setattr(fake_client, "book_appointment", boom)
+    for kwargs in ({}, {"confirm": False}):
+        with pytest.raises(RuntimeError, match="CONFIRMATION REQUIRED"):
+            await server.book_appointment(patient_id=2220055, booking_string="BSTR", **kwargs)
+    assert called == []
+
+
+async def test_reschedule_without_confirm_is_refused_and_does_not_call(fake_client):
+    with pytest.raises(RuntimeError, match="CONFIRMATION REQUIRED"):
+        await server.reschedule_appointment(
+            patient_id=2220055, appointment_id="APPT-1", booking_string="BSTR",
+            new_slot_date="2026-06-18T09:00:00",
+        )
+    assert fake_client.reschedule_called is False
 
 
 async def test_search_slots_end_date_filters_client_side(fake_client):

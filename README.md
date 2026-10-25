@@ -102,6 +102,14 @@ reschedule never cancels without rebooking and defaults to earlier-only; polite 
 with backoff; tokens/credentials are never logged or returned; request/response bodies (which
 carry medical data) are not logged.
 
+## Fork changes (secewicz/medicover-mcp)
+
+Forked from mattijskersten/medimcp at 09c9415 for the Home Lab's mcp-hub. Two behavioural changes, nothing else:
+
+- `book_appointment` and `reschedule_appointment` take `confirm: bool = False` and refuse (reply starts
+  `CONFIRMATION REQUIRED`) unless it is `true`, so a human approves each write.
+- `reschedule_appointment` lost its `require_earlier` parameter: it can only move to a strictly earlier slot.
+
 ## Disclaimer
 
 Unofficial, built against an undocumented private API that may change without notice. Use with
