@@ -184,3 +184,38 @@ async def test_retries_on_503(store, settings):
     assert profiles == []
     assert state["n"] == 2  # retried once
     await client.aclose()
+
+
+async def test_a_rejected_refresh_rereads_a_replaced_login_file_once(store, settings):
+    """Fork change: `medicover-auth login`/`set-token` replaces the file under a running process."""
+    from medicover_mcp.store import StoredCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if request.url.path == "/connect/token" and "RT-new" in body:
+            return httpx.Response(200, json=token_response(HOLDER_MRN, "RT-new-1"))
+        if request.url.path == "/connect/token":
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        return httpx.Response(404)
+
+    client = build_client(store, settings, handler)
+    with pytest.raises(AuthError):
+        await client.list_profiles()                       # the file's token is dead; loads and caches it
+    store.save(StoredCredentials(refresh_token="RT-new", device_id="dev-1", holder_mrn=HOLDER_MRN))
+    await client._holder_access_token()                    # same process, no restart
+    assert store.load().refresh_token == "RT-new-1"
+    await client.aclose()
+
+
+async def test_a_rejected_refresh_with_an_unchanged_file_still_raises(store, settings):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    client = build_client(store, settings, handler)
+    with pytest.raises(AuthError):
+        await client.list_profiles()
+    assert len(calls) == 1                                  # no retry of the same dead token
+    await client.aclose()

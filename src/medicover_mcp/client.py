@@ -62,18 +62,30 @@ class MedicoverClient:
         if self._holder_token is not None and not self._holder_token.is_expired():
             return self._holder_token.access_token
         creds = self._load_creds()
-        resp = await self._http.post(
-            config.TOKEN_ENDPOINT,
-            data=auth.build_refresh_request(creds.refresh_token),
-            headers={"Accept": "application/json"},
-        )
-        tokens = auth.parse_token_response(resp)
+        try:
+            tokens = await self._refresh_holder(creds.refresh_token)
+        except AuthError:
+            # Fork change: a new `medicover-auth login` / `set-token` replaces the file while this process
+            # keeps its first copy in memory. Re-read it once; if it holds a different token, use that.
+            fresh = self._store.load()
+            if fresh.refresh_token == creds.refresh_token:
+                raise
+            self._creds = creds = fresh
+            tokens = await self._refresh_holder(creds.refresh_token)
         self._holder_token = tokens
         self._holder_mrn = _sub_of(tokens.access_token)
         if tokens.refresh_token and tokens.refresh_token != creds.refresh_token:
             creds.refresh_token = tokens.refresh_token
             self._store.save(creds)  # persist the rotated token immediately
         return tokens.access_token
+
+    async def _refresh_holder(self, refresh_token: str) -> TokenSet:
+        resp = await self._http.post(
+            config.TOKEN_ENDPOINT,
+            data=auth.build_refresh_request(refresh_token),
+            headers={"Accept": "application/json"},
+        )
+        return auth.parse_token_response(resp)
 
     async def _holder_mrn_value(self) -> int | None:
         if self._holder_mrn is None:
