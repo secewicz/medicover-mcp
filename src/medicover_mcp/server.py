@@ -14,6 +14,7 @@ import logging
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import config, models
@@ -24,6 +25,9 @@ from .store import CredentialError, CredentialStore
 log = logging.getLogger("medicover_mcp")
 
 mcp = FastMCP("medicover")
+
+# Fork change: the lab's mcp-hub guard lists a read tool only if the server says readOnlyHint=true.
+_READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 _settings = config.Settings.from_env()
 _store = CredentialStore(_settings.store_path)
@@ -59,7 +63,7 @@ def _friendly(exc: Exception) -> str:
 # --- patients ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_patients() -> list[models.Patient]:
     """List every patient the logged-in account can act on.
 
@@ -77,7 +81,7 @@ async def list_patients() -> list[models.Patient]:
 # --- appointments -----------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_appointments(
     patient_id: Annotated[
         int | None,
@@ -104,7 +108,7 @@ async def list_appointments(
 # --- reference / lookup -----------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_appointment_filters(
     patient_id: Annotated[
         int | None, Field(description="MRN; defaults to the account holder.")
@@ -128,7 +132,7 @@ async def list_appointment_filters(
         raise RuntimeError(_friendly(exc)) from exc
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_search_filters(
     region_ids: Annotated[list[str], Field(description="Region IDs (e.g. ['204'] = Warszawa).")],
     specialty_ids: Annotated[list[str], Field(description="Specialty IDs to search within.")],
@@ -170,7 +174,7 @@ async def list_search_filters(
 # --- slot search ------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def search_slots(
     region_ids: Annotated[list[str], Field(description="Region IDs (e.g. ['204']). Required.")],
     specialty_ids: Annotated[list[str], Field(description="Specialty IDs. Required.")],

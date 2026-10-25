@@ -134,3 +134,16 @@ async def test_search_slots_forwards_search_type(fake_client):
         slot_search_type="DiagnosticProcedure",
     )
     assert fake_client.search_kwargs["slot_search_type"] == "DiagnosticProcedure"
+
+
+async def test_read_tools_are_hinted_read_only_and_writes_are_not():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    reads = {"list_patients", "list_appointments", "list_appointment_filters",
+             "list_search_filters", "search_slots"}
+    writes = {"book_appointment", "reschedule_appointment"}
+    assert set(tools) == reads | writes
+    for name in reads:
+        assert tools[name].annotations is not None and tools[name].annotations.readOnlyHint is True
+    for name in writes:
+        assert not (tools[name].annotations and tools[name].annotations.readOnlyHint)
+        assert "confirm" in tools[name].inputSchema["properties"]
