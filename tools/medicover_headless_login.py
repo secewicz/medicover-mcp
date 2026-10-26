@@ -134,7 +134,8 @@ def fill_code_and_submit(c: Cdp, code: str, say=base.eprint) -> None:
         || btns.find(b => /confirm|verify|potwierd|zatwierd|dalej|continue|zaloguj/i.test(label(b)) && !/again|resend|ponown|wy\u015blij/i.test(label(b)))
         || (btns.length === 1 ? btns[0] : null);
       if (pick) pick.click(); else f.requestSubmit();
-      return JSON.stringify({trustBox: !!box, picked: pick ? label(pick).slice(0, 30) : null, buttons: btns.map(b => (b.name || '') + '=' + label(b).slice(0, 24))});
+      return JSON.stringify({trustBox: !!box, picked: pick ? label(pick).slice(0, 30) : null, buttons: btns.map(b => (b.name || '') + '=' + label(b).slice(0, 24)),
+        inputs: Array.from(f.querySelectorAll('input')).map(i => (i.name || '(unnamed)') + ':' + i.type + (i.type === 'checkbox' ? (i.checked ? ':checked' : ':unchecked') : ''))});
     })()""")
     say(f"[code page] submitted: {seen}")
 
@@ -245,10 +246,15 @@ def main() -> int:
     if not user or not password:
         base.eprint("username and password are required")
         return 2
+    if args.device_key == "last":
+        args.device_key = (Path.home() / ".medicover-test-device-key").read_text().strip()
+        base.eprint("using the device key saved by the last --new-device run")
     if args.new_device:
         import uuid
         dk = str(uuid.uuid4())
-        base.eprint("NEW device key (use it again with --device-key to test that the password alone is enough next time):", dk)
+        (Path.home() / ".medicover-test-device-key").write_text(dk)
+        os.chmod(Path.home() / ".medicover-test-device-key", 0o600)
+        base.eprint("NEW device key saved for this test: use `--device-key last` next time to check that the password alone is enough")
     else:
         dk = args.device_key or trusted_device_key(Path(args.profile).expanduser())
         base.eprint("trusted device key:", "found" if dk else "NOT found (the portal will treat this as a new device)")
