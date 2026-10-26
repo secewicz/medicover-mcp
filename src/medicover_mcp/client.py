@@ -68,16 +68,29 @@ class MedicoverClient:
             # Fork change: a new `medicover-auth login` / `set-token` replaces the file while this process
             # keeps its first copy in memory. Re-read it once; if it holds a different token, use that.
             fresh = self._store.load()
-            if fresh.refresh_token == creds.refresh_token:
-                raise
-            self._creds = creds = fresh
-            tokens = await self._refresh_holder(creds.refresh_token)
+            if fresh.refresh_token != creds.refresh_token:
+                self._creds = creds = fresh
+                try:
+                    tokens = await self._refresh_holder(creds.refresh_token)
+                except AuthError:
+                    tokens = await self._renew_silently(creds)
+            else:
+                tokens = await self._renew_silently(creds)
         self._holder_token = tokens
         self._holder_mrn = _sub_of(tokens.access_token)
         if tokens.refresh_token and tokens.refresh_token != creds.refresh_token:
             creds.refresh_token = tokens.refresh_token
             self._store.save(creds)  # persist the rotated token immediately
         return tokens.access_token
+
+    async def _renew_silently(self, creds: StoredCredentials) -> TokenSet:
+        """Fork change: the refresh token is dead; ask the portal for a new one with the stored sign-in session (no browser)."""
+        if not creds.sso_cookies:
+            raise AuthError("refresh/exchange rejected (invalid_grant) — session expired or revoked; " + _reauth_hint())
+        tokens, cookies = await asyncio.to_thread(auth.silent_signin, creds.sso_cookies, creds.sso_device_id)
+        creds.sso_cookies = cookies
+        log.warning("the refresh token was rejected; renewed the session silently from the stored sign-in")
+        return tokens
 
     async def _refresh_holder(self, refresh_token: str) -> TokenSet:
         resp = await self._http.post(

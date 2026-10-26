@@ -187,3 +187,45 @@ def test_login_flow_rejects_bad_sms_code():
     flow.request_mfa()
     with pytest.raises(AuthError, match="not accepted"):
         flow.submit_mfa("123456")
+
+
+# --- fork change: silent sign-in (prompt=none) -------------------------------------------
+
+
+def _silent_client(handler):
+    import httpx as _httpx
+    return _httpx.Client(transport=_httpx.MockTransport(handler), follow_redirects=False)
+
+
+def test_silent_signin_exchanges_the_code_the_portal_hands_back():
+    import httpx as _httpx
+    from medicover_mcp.auth import silent_signin
+    seen = {}
+
+    def handler(request):
+        if request.url.path == "/connect/authorize":
+            seen["authorize"] = dict(request.url.params)
+            seen["cookie"] = request.headers.get("cookie", "")
+            return _httpx.Response(302, headers={"location": "https://online24.medicover.pl/signin-oidc?code=CODE1&state=s"})
+        if request.url.path == "/connect/token":
+            body = request.content.decode()
+            assert "grant_type=authorization_code" in body and "code=CODE1" in body and "code_verifier=" in body
+            return _httpx.Response(200, json={"access_token": "a.b.c", "refresh_token": "RT-new", "expires_in": 180})
+        return _httpx.Response(404)
+
+    tokens, cookies = silent_signin({"idsrv": "S1", "cookiesession1": "W1"}, "DEV", client=_silent_client(handler))
+    assert tokens.refresh_token == "RT-new"
+    assert seen["authorize"]["prompt"] == "none" and seen["authorize"]["device_id"] == "DEV"
+    assert "idsrv=S1" in seen["cookie"]
+    assert cookies["idsrv"] == "S1"
+
+
+def test_silent_signin_says_so_when_the_portal_wants_a_login():
+    import httpx as _httpx
+    from medicover_mcp.auth import AuthError, silent_signin
+
+    def handler(request):
+        return _httpx.Response(302, headers={"location": "https://online24.medicover.pl/signin-oidc?error=login_required&state=s"})
+
+    with pytest.raises(AuthError, match="login_required"):
+        silent_signin({"idsrv": "S1"}, "DEV", client=_silent_client(handler))

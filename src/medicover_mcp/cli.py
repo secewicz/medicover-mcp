@@ -159,6 +159,43 @@ def cmd_set_token(settings: config.Settings, from_stdin: bool = False) -> int:
     return 0
 
 
+def cmd_set_session(settings: config.Settings) -> int:
+    """Fork change: store a portal sign-in session (and a refresh token as a fallback) piped in as JSON on stdin by
+    tools/medicover_browser_login.py: {"cookies": {...}, "device_id": "...", "refresh_token": "..."}. The server renews its own login
+    from the cookies whenever a refresh is rejected, so a login no longer has to be redone by hand. Nothing is printed."""
+    store = CredentialStore(settings.store_path)
+    try:
+        data = json.loads(sys.stdin.read())
+        cookies = data.get("cookies") or None
+        device = data.get("device_id") or None
+        rt = _extract_refresh_token(data.get("refresh_token") or "")
+    except (ValueError, AttributeError):
+        _eprint("error: stdin is not the JSON this command reads")
+        return 2
+    tokens = None
+    if cookies:
+        try:   # a session of our own: independent of the browser's token chain, so nothing in the browser can revoke it
+            tokens, cookies = auth.silent_signin(cookies, device)
+        except (AuthError, httpx.HTTPError) as exc:
+            _eprint(f"Silent sign-in did not work: {exc}")
+    if tokens is None and rt:
+        try:
+            with httpx.Client(timeout=settings.request_timeout, headers={"User-Agent": config.USER_AGENT}) as c:
+                tokens = auth.parse_token_response(
+                    c.post(config.TOKEN_ENDPOINT, data=auth.build_refresh_request(rt), headers={"Accept": "application/json"}))
+        except (AuthError, httpx.HTTPError) as exc:
+            _eprint(f"Refresh token rejected: {exc}")
+    if tokens is None or not tokens.refresh_token:
+        _eprint("error: nothing in the session could be turned into a login")
+        return 1
+    holder_mrn = _jwt_sub(tokens.access_token)
+    store.save(StoredCredentials(refresh_token=tokens.refresh_token, device_id=new_device_id(), holder_mrn=holder_mrn,
+                                 sso_cookies=cookies, sso_device_id=device))
+    _eprint(f"Saved to {store.path} (mode 0600). Authenticated as MRN {holder_mrn}. "
+            f"Self-renewal from the portal's sign-in: {'on' if cookies else 'off'}.")
+    return 0
+
+
 def cmd_status(settings: config.Settings) -> int:
     store = CredentialStore(settings.store_path)
     if not store.exists():
@@ -173,6 +210,7 @@ def cmd_status(settings: config.Settings) -> int:
     _eprint(f"  account holder MRN: {creds.holder_mrn or 'unknown'}")
     _eprint(f"  device id:          {creds.device_id}")
     _eprint("  refresh token:      present (value not shown)")
+    _eprint(f"  self-renewal:       {'ON (sign-in session stored)' if getattr(creds, 'sso_cookies', None) else 'off'}")
     return 0
 
 
@@ -195,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         help="bootstrap by pasting a refresh token from a logged-in browser session",
     )
     st.add_argument("--stdin", action="store_true", help="read the token from the first line of stdin instead of prompting")
+    sub.add_parser("set-session", help="store a portal sign-in session piped in as JSON on stdin (see tools/medicover_browser_login.py)")
     sub.add_parser("status", help="show whether credentials are stored (no secrets shown)")
     sub.add_parser("logout", help="delete the stored credentials")
     args = parser.parse_args(argv)
@@ -204,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_login(settings)
     if args.command == "set-token":
         return cmd_set_token(settings, from_stdin=args.stdin)
+    if args.command == "set-session":
+        return cmd_set_session(settings)
     if args.command == "status":
         return cmd_status(settings)
     if args.command == "logout":

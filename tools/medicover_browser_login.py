@@ -10,10 +10,12 @@ The portal's password step is guarded by something only a browser can satisfy, s
   1. start Google Chrome with its own profile directory (default ~/.medicover-chrome; kept between runs) and remote debugging on loopback;
   2. YOU log in to online24.medicover.pl in that window: password, the code Medicover sends, and "trust this device". If the profile's
      session is still valid the page signs itself in and you type nothing;
-  3. the moment the page holds a refresh token, this tool reads it, REMOVES it from the browser's storage (so the page cannot refresh a
+  3. the moment the page holds a refresh token, this tool reads the portal's sign-in session (cookies idsrv*, cookiesession1, the page's
+     device key) and the token. The SERVER renews its own login from that session whenever a refresh is rejected (no browser, no
+     password, no code: `prompt=none`, measured 26 Oct 2026), so this is only needed again when the portal ends the session. It then reads the token, REMOVES it from the browser's storage (so the page cannot refresh a
      token the server now owns, which the portal punishes by revoking the chain), closes Chrome, and delivers the token:
-       --local  PATH   write it with `medicover-auth set-token --stdin` into this credential file (a local test), or
-       --hub    HOST   run `medicover-auth set-token --stdin` on the hub as the account's service user over ssh.
+       --local  PATH   write it with `medicover-auth set-session` into this credential file (a local test), or
+       --hub    HOST   run `medicover-auth set-session` on the hub as the account's service user over ssh.
 
 The token is never printed, never put on a command line and never written to disk by this tool; it goes to the child process's stdin.
 
@@ -133,15 +135,26 @@ def diagnose(label: str, ws_url: str) -> None:
     eprint(f"   storage keys: local={[k[:60] for k in keys.get('local', [])]} session={[k[:60] for k in keys.get('session', [])]}")
 
 
+def session_of(ws_url: str, refresh_token: str) -> str:
+    """The portal's sign-in session as JSON for `medicover-auth set-session`: the login host's cookies (idsrv*, cookiesession1),
+    the SPA's device key and the refresh token as a fallback. It goes to a child's stdin and nowhere else."""
+    cookies = {}
+    for c in cdp_call(ws_url, "Network.getAllCookies").get("cookies", []):
+        if "login-online24.medicover.pl" in c.get("domain", "") and (c.get("name", "").lower().startswith("idsrv") or c.get("name") == "cookiesession1"):
+            cookies[c["name"]] = c["value"]
+    device = evaluate(ws_url, "localStorage.getItem('deviceKey')") or None
+    return json.dumps({"cookies": cookies, "device_id": device, "refresh_token": refresh_token})
+
+
 def deliver(token: str, args: argparse.Namespace) -> int:
     if args.local:
-        cmd = ["uv", "run", "--quiet", "medicover-auth", "set-token", "--stdin"]
+        cmd = ["uv", "run", "--quiet", "medicover-auth", "set-session"]
         env = dict(os.environ, MEDICOVER_STORE_PATH=str(Path(args.local).expanduser()))
         cwd = str(Path(__file__).resolve().parent.parent)
     else:
         user = f"mcp_medicover_{args.account}"
         remote = (f"runuser -u {user} -- env MEDICOVER_STORE_PATH=/var/lib/mcp-hub-medicover/{args.account}/credentials.json "
-                  f"/opt/medicover-mcp/.venv/bin/medicover-auth set-token --stdin")
+                  f"/opt/medicover-mcp/.venv/bin/medicover-auth set-session")
         if args.restart:
             remote += f"; rc=$?; systemctl restart mcp-hub-medicover@{args.account}; exit $rc"
         cmd = ["ssh", "-i", str(Path(args.key).expanduser()), args.hub, remote]
@@ -191,7 +204,7 @@ def main() -> int:
                         if found:
                             if args.diagnose:
                                 diagnose("at the moment of login", t["webSocketDebuggerUrl"])
-                            token = json.loads(found)["t"]
+                            token = session_of(t["webSocketDebuggerUrl"], json.loads(found)["t"])   # JSON; goes to the child's stdin only
                             if args.keep_days > 0:
                                 kept = persist_login_cookie(t["webSocketDebuggerUrl"], args.keep_days)
                                 eprint(f"Kept the portal's sign-in cookie in the profile for {args.keep_days} days: {kept}")

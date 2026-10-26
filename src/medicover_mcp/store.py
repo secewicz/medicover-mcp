@@ -26,13 +26,21 @@ class StoredCredentials:
     device_id: str
     # MRN of the account holder this refresh token authenticates as (informational).
     holder_mrn: int | None = None
+    # Fork change: the portal's sign-in session (cookies idsrv*, cookiesession1 of the login host) and the SPA's device key. With
+    # them the server renews its own login when a refresh is rejected (auth.silent_signin): no browser, no password, no code.
+    sso_cookies: dict | None = None
+    sso_device_id: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "refresh_token": self.refresh_token,
             "device_id": self.device_id,
             "holder_mrn": self.holder_mrn,
         }
+        if self.sso_cookies:
+            d["sso_cookies"] = self.sso_cookies
+            d["sso_device_id"] = self.sso_device_id
+        return d
 
 
 class CredentialStore:
@@ -53,6 +61,8 @@ class CredentialStore:
                 refresh_token=data["refresh_token"],
                 device_id=data["device_id"],
                 holder_mrn=data.get("holder_mrn"),
+                sso_cookies=data.get("sso_cookies"),
+                sso_device_id=data.get("sso_device_id"),
             )
         except (KeyError, ValueError) as exc:
             raise CredentialError(

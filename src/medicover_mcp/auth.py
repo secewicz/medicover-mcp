@@ -152,6 +152,56 @@ def parse_token_response(resp: httpx.Response) -> TokenSet:
     return TokenSet.from_response(resp.json())
 
 
+def silent_signin(
+    cookies: dict, device_id: str | None, client: httpx.Client | None = None
+) -> tuple["TokenSet", dict]:
+    """Fork change: renew the login from the portal's sign-in cookies, with no browser and no password (`prompt=none`).
+
+    The password step is the part the portal refuses to a script; a session that already exists is not. The portal answers the
+    authorize request with a code when the sign-in cookie is still good (and `login_required` when it is not), and the code is
+    exchanged exactly as the page does. Returns the new tokens and the cookies (updated if the portal rotated them).
+    """
+    owns = client is None
+    c = client or httpx.Client(follow_redirects=False, timeout=30, headers=dict(config.BROWSER_NAV_HEADERS))
+    try:
+        host = httpx.URL(config.AUTH_HOST).host
+        for name, value in cookies.items():
+            c.cookies.set(name, value, domain=host, path="/")
+        verifier, challenge = generate_pkce()
+        params = {
+            "client_id": config.CLIENT_ID,
+            "redirect_uri": config.REDIRECT_URI,
+            "response_type": "code",
+            "scope": config.SCOPE,
+            "state": secrets.token_hex(16),
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_mode": "query",
+            "ui_locales": "en",
+            "app_version": config.APP_VERSION,
+            "device_id": device_id or new_device_id(),
+            "device_name": "Chrome",
+            "ts": str(int(time.time() * 1000)),
+            "prompt": "none",
+        }
+        resp = c.get(config.AUTHORIZE_ENDPOINT, params=params)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(resp.headers.get("location", "")).query)
+        if "code" not in query:
+            reason = query.get("error", ["no_redirect"])[0]
+            raise AuthError(f"silent sign-in refused ({reason}) — the portal's session is over; log in again")
+        tok = c.post(config.TOKEN_ENDPOINT, data=build_authorization_code_request(query["code"][0], verifier),
+                     headers={"Accept": "application/json"})
+        tokens = parse_token_response(tok)
+        fresh = dict(cookies)
+        for name in list(fresh):
+            if name in c.cookies:
+                fresh[name] = c.cookies.get(name) or fresh[name]
+        return tokens, fresh
+    finally:
+        if owns:
+            c.close()
+
+
 # --- HTML form scraping (login / mfa pages) ---------------------------------------------
 
 

@@ -219,3 +219,40 @@ async def test_a_rejected_refresh_with_an_unchanged_file_still_raises(store, set
         await client.list_profiles()
     assert len(calls) == 1                                  # no retry of the same dead token
     await client.aclose()
+
+
+async def test_a_dead_refresh_token_is_renewed_from_the_stored_sign_in(store, settings, monkeypatch):
+    """Fork change: with a stored sign-in session the server renews its own login; without one it still reports the expiry."""
+    from medicover_mcp import auth
+    from medicover_mcp.auth import TokenSet
+    from medicover_mcp.store import StoredCredentials
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    called = []
+
+    def fake_silent(cookies, device_id, client=None):
+        called.append((dict(cookies), device_id))
+        return TokenSet(access_token=token_response(HOLDER_MRN, "x")["access_token"], refresh_token="RT-silent", expires_in=180, scope=""), {"idsrv": "S2"}
+
+    monkeypatch.setattr(auth, "silent_signin", fake_silent)
+    store.save(StoredCredentials(refresh_token="RT-dead", device_id="dev-1", holder_mrn=HOLDER_MRN,
+                                 sso_cookies={"idsrv": "S1"}, sso_device_id="DEVKEY"))
+    client = build_client(store, settings, handler)
+    await client._holder_access_token()
+    assert called == [({"idsrv": "S1"}, "DEVKEY")]
+    saved = store.load()
+    assert saved.refresh_token == "RT-silent"
+    assert saved.sso_cookies == {"idsrv": "S2"}
+    await client.aclose()
+
+
+async def test_without_a_stored_sign_in_a_dead_token_still_raises(store, settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    client = build_client(store, settings, handler)
+    with pytest.raises(AuthError, match="expired or revoked"):
+        await client.list_profiles()
+    await client.aclose()
