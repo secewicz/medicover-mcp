@@ -118,13 +118,25 @@ STAGE_JS = """(() => { const q = (s) => document.querySelector(s);
     errors: (document.body.innerText || '').split('\\n').map(x => x.trim()).filter(x => x && x.length < 140 && /incorrect|oops|try again|invalid|error|nieprawid|b\u0142\u0105d|blocked|captcha|too many|locked|zablok/i.test(x)).slice(0,4)}); })()"""
 
 
-def fill_code_and_submit(c: Cdp, code: str) -> None:
-    """The emailed-code page: type the code, TICK 'trust this device' (so the next login from this device key needs only the password) and submit."""
+def fill_code_and_submit(c: Cdp, code: str, say=base.eprint) -> None:
+    """The emailed-code page: type the code, TICK 'trust this device' (so the next login from this device key needs only the password) and press
+    CONFIRM. The page may also have a 'send the code again' button, and pressing that instead invalidates the code just typed (seen 26 Oct
+    2026), so the button is picked by its value/label, never by being the first one."""
     c.js("(() => { const e = document.querySelector('input[name=\"Input.MfaCode\"]'); e.focus(); e.value = ''; })()")
     c.call("Input.insertText", {"text": code})
     time.sleep(0.4)
-    c.js("""(() => { const box = document.querySelector('input[name="Input.IsTrustedDevice"][type=checkbox]'); if (box && !box.checked) box.click();
-      const f = document.querySelector('input[name="Input.MfaCode"]').form; const b = f.querySelector('button[type=submit], input[type=submit], button[name="Input.Button"]'); b ? b.click() : f.requestSubmit(); })()""")
+    seen = c.js("""(() => {
+      const box = document.querySelector('input[name="Input.IsTrustedDevice"][type=checkbox]'); if (box && !box.checked) box.click();
+      const f = document.querySelector('input[name="Input.MfaCode"]').form;
+      const btns = Array.from(f.querySelectorAll('button, input[type=submit]'));
+      const label = (b) => ((b.value || '') + ' ' + (b.textContent || '')).trim();
+      const pick = btns.find(b => (b.value || '').toLowerCase() === 'confirm')
+        || btns.find(b => /confirm|verify|potwierd|zatwierd|dalej|continue|zaloguj/i.test(label(b)) && !/again|resend|ponown|wy\u015blij/i.test(label(b)))
+        || (btns.length === 1 ? btns[0] : null);
+      if (pick) pick.click(); else f.requestSubmit();
+      return JSON.stringify({trustBox: !!box, picked: pick ? label(pick).slice(0, 30) : null, buttons: btns.map(b => (b.name || '') + '=' + label(b).slice(0, 24))});
+    })()""")
+    say(f"[code page] submitted: {seen}")
 
 
 def fill_and_submit(c: Cdp, user: str, password: str) -> None:
@@ -176,13 +188,13 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
                         on_code_page()
                 if code_sent:
                     mfa_after_code += 1
-                    if mfa_after_code >= 4:       # the page came back after the code: the portal did not accept it
-                        status = "code"
+                    if mfa_after_code >= 8:       # still the code page 12 seconds after the code: the portal did not accept it
+                        status = "code_rejected"
                         break
                     continue
                 code = code_provider()
                 if code:
-                    fill_code_and_submit(c, code)
+                    fill_code_and_submit(c, code, say)
                     code_sent = True
                     continue
                 if time.monotonic() > code_deadline:
@@ -253,12 +265,13 @@ def main() -> int:
                                 code_provider=provider if args.ask_code else None)
     password = ""   # noqa: F841
     messages = {"ok": "RESULT: signed in without the emailed code; a session exists.",
-                "code": "RESULT: the portal asks for the emailed code on this fresh profile (trust did not carry over).",
+                "code": "RESULT: the portal asks for the emailed code on this fresh profile and none was given (trust did not carry over).",
+                "code_rejected": "RESULT: a code was typed but the portal stayed on the code page (wrong or expired code, or the wrong button).",
                 "rejected": "RESULT: the login form came back after the submit (wrong credentials, or the portal did not let a headless browser through).",
                 "timeout": "RESULT: timed out before a session or a refusal."}
     base.eprint(messages[status])
     if status != "ok":
-        return {"code": 3, "rejected": 4}.get(status, 1)
+        return {"code": 3, "code_rejected": 3, "rejected": 4}.get(status, 1)
     if args.dry:
         return 0
     return base.deliver(json.dumps(session), args)

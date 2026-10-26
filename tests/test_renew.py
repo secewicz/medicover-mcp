@@ -122,3 +122,9 @@ def test_the_status_file_is_public_and_holds_no_secret(tmp_path):
     assert d["state"] == "awaiting_code" and d["deadline"] == 123 and d["account"] == "filip"
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
     renew.write_status(None, "filip", "ok")            # no path: silently nothing
+
+
+def test_a_code_the_portal_did_not_accept_blocks_like_a_code_that_never_came():
+    state = {}
+    renew.apply_result(state, "code_rejected", 10.0, H)
+    assert state["blocked"]["reason"] == "code" and renew.decide(state, 20.0, H) == ("blocked", "code")

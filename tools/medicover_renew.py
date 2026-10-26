@@ -106,7 +106,7 @@ def apply_result(state: dict, status: str, now: float, secret: str) -> None:
         state["failures"], state["blocked"] = 0, None
     elif status == "rejected":
         state["blocked"] = {"reason": "password", "secret": secret, "at": now}
-    elif status == "code":
+    elif status in ("code", "code_rejected"):
         state["blocked"] = {"reason": "code", "secret": secret, "until": now + CODE_BLOCK_SECONDS, "at": now}
     else:
         state["failures"] = state.get("failures", 0) + 1
