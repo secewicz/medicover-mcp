@@ -125,17 +125,25 @@ def fill_code_and_submit(c: Cdp, code: str, say=base.eprint) -> None:
     c.js("(() => { const e = document.querySelector('input[name=\"Input.MfaCode\"]'); e.focus(); e.value = ''; })()")
     c.call("Input.insertText", {"text": code})
     time.sleep(0.4)
-    seen = c.js("""(() => {
-      const box = document.querySelector('input[name="Input.IsTrustedDevice"][type=checkbox]'); if (box && !box.checked) box.click();
+    seen = c.js(r"""(() => {
       const f = document.querySelector('input[name="Input.MfaCode"]').form;
+      // The 'trust this device' box: the portal's own checkbox may be custom-styled (hidden input + label), so find it by name, then by the words
+      // on its label, then as the only checkbox of the form; click it, and force the state if the click did not take.
+      const boxes = Array.from(f.querySelectorAll('input[type=checkbox]'));
+      const text = (b) => ((b.closest('label') || {}).textContent || '') + ' ' + ((b.id && document.querySelector('label[for="' + b.id + '"]') || {}).textContent || '');
+      let box = boxes.find(b => /trust/i.test(b.name)) || boxes.find(b => /trust|zaufa|zapami|remember|urz\u0105dz|device/i.test(text(b)));
+      if (!box && boxes.length === 1) box = boxes[0];
+      if (box && !box.checked) { box.click(); if (!box.checked) { box.checked = true; box.dispatchEvent(new Event('change', {bubbles: true})); } }
+      const trustLabel = box ? text(box).replace(/\s+/g, ' ').trim().slice(0, 50) : null;
       const btns = Array.from(f.querySelectorAll('button, input[type=submit]'));
       const label = (b) => ((b.value || '') + ' ' + (b.textContent || '')).trim();
       const pick = btns.find(b => (b.value || '').toLowerCase() === 'confirm')
         || btns.find(b => /confirm|verify|potwierd|zatwierd|dalej|continue|zaloguj/i.test(label(b)) && !/again|resend|ponown|wy\u015blij/i.test(label(b)))
         || (btns.length === 1 ? btns[0] : null);
       if (pick) pick.click(); else f.requestSubmit();
-      return JSON.stringify({trustBox: !!box, picked: pick ? label(pick).slice(0, 30) : null, buttons: btns.map(b => (b.name || '') + '=' + label(b).slice(0, 24)),
-        inputs: Array.from(f.querySelectorAll('input')).map(i => (i.name || '(unnamed)') + ':' + i.type + (i.type === 'checkbox' ? (i.checked ? ':checked' : ':unchecked') : ''))});
+      return JSON.stringify({trustBox: !!box, trustChecked: box ? box.checked : null, trustLabel: trustLabel, picked: pick ? label(pick).slice(0, 30) : null, buttons: btns.map(b => (b.name || '') + '=' + label(b).slice(0, 24)),
+        inputs: Array.from(f.querySelectorAll('input')).map(i => (i.name || '(unnamed)') + ':' + i.type + (i.type === 'checkbox' ? (i.checked ? ':checked' : ':unchecked') : '')),
+        labels: Array.from(f.querySelectorAll('label')).map(l => l.textContent.replace(/\s+/g, ' ').trim().slice(0, 40)).filter(Boolean).slice(0, 6)});
     })()""")
     say(f"[code page] submitted: {seen}")
 
