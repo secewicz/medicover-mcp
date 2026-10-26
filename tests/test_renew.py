@@ -87,3 +87,14 @@ def test_the_state_never_holds_the_password(tmp_path):
     renew.apply_result(state, "rejected", 1.0, renew.secret_hash("934013", "hunter2-secret", "devkey"))
     blob = json.dumps(state)
     assert "hunter2-secret" not in blob and "devkey" not in blob and "934013" not in blob
+
+
+def test_env_values_accept_base64_so_any_password_survives_the_env_file(monkeypatch):
+    import base64
+    monkeypatch.setenv("MEDICOVER_PASSWORD_B64", base64.b64encode('p "a" \\ $x \u0105 '.encode()).decode())
+    monkeypatch.setenv("MEDICOVER_PASSWORD", "ignored")
+    assert renew.env_value("MEDICOVER_PASSWORD") == 'p "a" \\ $x \u0105 '
+    monkeypatch.setenv("MEDICOVER_PASSWORD_B64", "!!not base64!!")
+    assert renew.env_value("MEDICOVER_PASSWORD") == ""
+    monkeypatch.delenv("MEDICOVER_PASSWORD_B64")
+    assert renew.env_value("MEDICOVER_PASSWORD") == "ignored"

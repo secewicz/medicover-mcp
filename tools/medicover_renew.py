@@ -17,7 +17,7 @@ emailed code; 4 = blocked: the password was rejected; 5 = blocked: repeated fail
 the hub's check turns into the Kuma monitor `mcp-hub medicover renewal` going DOWN (and Slack). Nothing secret is printed.
 
     medicover_renew.py --account filip --port 9094 --state-file /var/lib/mcp-hub-medicover/filip/renewal.json
-Environment: MEDICOVER_USERNAME, MEDICOVER_PASSWORD, MEDICOVER_DEVICE_KEY, MEDICOVER_STORE_PATH (and MEDICOVER_CHROME / MEDICOVER_CHROME_ARGS).
+Environment: MEDICOVER_USERNAME, MEDICOVER_PASSWORD, MEDICOVER_DEVICE_KEY (each also as NAME_B64), MEDICOVER_STORE_PATH (and MEDICOVER_CHROME / MEDICOVER_CHROME_ARGS).
 """
 from __future__ import annotations
 
@@ -37,6 +37,18 @@ DAILY_MAX = 6                 # browser logins in any 24 hours
 FAIL_BLOCK_AFTER = 3          # consecutive failures that are not a refusal
 FAIL_BLOCK_SECONDS = 6 * 3600
 BLOCK_EXIT = {"code": EXIT_CODE, "password": EXIT_PASSWORD, "repeated": EXIT_REPEATED}
+
+
+def env_value(name: str) -> str:
+    """NAME_B64 (base64, what the hub's deploy writes so that ANY password survives systemd's env-file parser) or plain NAME."""
+    import base64
+    b64 = os.environ.get(name + "_B64")
+    if b64:
+        try:
+            return base64.b64decode(b64, validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return ""
+    return os.environ.get(name, "")
 
 
 def secret_hash(user: str, password: str, device_key: str) -> str:
@@ -126,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--timeout", type=int, default=150)
     args = p.parse_args(argv)
 
-    user, password, dk = (os.environ.get(k, "") for k in ("MEDICOVER_USERNAME", "MEDICOVER_PASSWORD", "MEDICOVER_DEVICE_KEY"))
+    user, password, dk = (env_value(k) for k in ("MEDICOVER_USERNAME", "MEDICOVER_PASSWORD", "MEDICOVER_DEVICE_KEY"))
     store = os.environ.get("MEDICOVER_STORE_PATH", "")
     if not (user and password and store):
         say(args.account, "MEDICOVER_USERNAME / MEDICOVER_PASSWORD / MEDICOVER_STORE_PATH are not set")
