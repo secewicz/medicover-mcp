@@ -37,7 +37,16 @@ from pathlib import Path
 
 from websockets.sync.client import connect
 
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+def _find_chrome() -> str:
+    """MEDICOVER_CHROME, else the first browser found: Chrome on macOS, then Chromium/Chrome on Linux (the hub)."""
+    for cand in (os.environ.get("MEDICOVER_CHROME"), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                 "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"):
+        if cand and Path(cand).exists():
+            return cand
+    return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+CHROME = _find_chrome()
 START_URL = "https://online24.medicover.pl/"
 HOST = "online24.medicover.pl"
 PORT = 9223

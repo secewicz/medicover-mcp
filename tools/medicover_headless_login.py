@@ -65,9 +65,18 @@ class Cdp:
             pass
 
 
+def extra_chrome_args() -> list[str]:
+    """MEDICOVER_CHROME_ARGS (space separated). On Linux, where the hub runs this inside an unprivileged container, the defaults are the
+    flags such a container needs: no user-namespace sandbox, no /dev/shm, no GPU. The browser only ever visits Medicover's own pages."""
+    env = os.environ.get("MEDICOVER_CHROME_ARGS")
+    if env is not None:
+        return env.split()
+    return ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"] if sys.platform.startswith("linux") else []
+
+
 def launch(profile: Path, port: int, url: str) -> subprocess.Popen:
     return subprocess.Popen(
-        [base.CHROME, "--headless=new", f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1", f"--user-data-dir={profile}",
+        [base.CHROME, "--headless=new", *extra_chrome_args(), f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1", f"--user-data-dir={profile}",
          "--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled", f"--user-agent={HEADLESS_UA}", url],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
@@ -118,6 +127,57 @@ def fill_and_submit(c: Cdp, user: str, password: str) -> None:
     c.js("(() => { const f = document.querySelector('input[name=\"Input.Password\"]').form; const b = f.querySelector('button[type=submit], input[type=submit], button[name=\"Input.Button\"]'); b ? b.click() : f.requestSubmit(); })()")
 
 
+def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=base.eprint) -> tuple[str, dict | None]:
+    """Log in once in a fresh headless Chrome. Returns (status, session): status is 'ok' (session = the JSON the server stores),
+    'code' (the portal asks for the emailed code), 'rejected' (the form came back after the submit: wrong password, or refused) or
+    'timeout'. Nothing secret is printed."""
+    tmp = Path(tempfile.mkdtemp(prefix="medicover-headless-"))
+    chrome = launch(tmp, PORT, "about:blank")
+    status, session = "timeout", None
+    try:
+        c = Cdp(page_ws(PORT, time.monotonic() + 20))
+        c.call("Page.enable"); c.call("Network.enable")
+        c.call("Network.setUserAgentOverride", {"userAgent": HEADLESS_UA})
+        if dk:
+            c.call("Page.addScriptToEvaluateOnNewDocument", {"source": f"if (location.origin === {json.dumps(SPA)} && !localStorage.getItem('deviceKey')) localStorage.setItem('deviceKey', {json.dumps(dk)});"})
+        c.call("Page.navigate", {"url": SPA + "/"})
+        submitted, last, back, deadline = False, None, 0, time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(1.5)
+            try:
+                st = json.loads(c.js(STAGE_JS) or "{}")
+            except Exception:
+                continue
+            stage = (st.get("host"), st.get("path"), st.get("login"), st.get("mfa"), tuple(st.get("errors") or ()))
+            if stage != last:
+                say(f"[stage] {st.get('host')}{st.get('path')}  login-form={st.get('login')}  code-page={st.get('mfa')}  portal-says={st.get('errors') or '-'}")
+                last = stage
+            if st.get("mfa"):
+                status = "code"
+                break
+            if st.get("login") and not submitted:
+                fill_and_submit(c, user, password)
+                submitted = True
+                continue
+            if st.get("login") and submitted:
+                back += 1
+                if back >= 3:
+                    status = "rejected"
+                    break
+            else:
+                back = 0
+            if "online24.medicover.pl" == st.get("host") and not st.get("login"):
+                found = c.js(base.FIND)
+                if found:
+                    status, session = "ok", json.loads(base.session_of_cdp(c, json.loads(found)["t"]))
+                    break
+        c.close()
+    finally:
+        base.close_chrome_port(chrome, PORT)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return status, session
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     where = p.add_mutually_exclusive_group(required=True)
@@ -140,61 +200,18 @@ def main() -> int:
     dk = args.device_key or trusted_device_key(Path(args.profile).expanduser())
     base.eprint("trusted device key:", "found" if dk else "NOT found (the portal will treat this as a new device)")
 
-    tmp = Path(tempfile.mkdtemp(prefix="medicover-headless-"))
-    chrome = launch(tmp, PORT, "about:blank")
-    result = 1
-    try:
-        c = Cdp(page_ws(PORT, time.monotonic() + 20))
-        c.call("Page.enable"); c.call("Network.enable")
-        c.call("Network.setUserAgentOverride", {"userAgent": HEADLESS_UA})
-        if dk:
-            c.call("Page.addScriptToEvaluateOnNewDocument", {"source": f"if (location.origin === {json.dumps(SPA)} && !localStorage.getItem('deviceKey')) localStorage.setItem('deviceKey', {json.dumps(dk)});"})
-        c.call("Page.navigate", {"url": SPA + "/"})
-        submitted, last, back, deadline = False, None, 0, time.monotonic() + args.timeout
-        while time.monotonic() < deadline:
-            time.sleep(1.5)
-            try:
-                st = json.loads(c.js(STAGE_JS) or "{}")
-            except Exception:
-                continue
-            stage = (st.get("host"), st.get("path"), st.get("login"), st.get("mfa"), tuple(st.get("errors") or ()))
-            if stage != last:
-                base.eprint(f"[stage] {st.get('host')}{st.get('path')}  login-form={st.get('login')}  code-page={st.get('mfa')}  portal-says={st.get('errors') or '-'}")
-                last = stage
-            if st.get("mfa"):
-                base.eprint("RESULT: the portal asks for the emailed code on this fresh profile (trust did not carry over).")
-                result = 3
-                break
-            if st.get("login") and not submitted:
-                fill_and_submit(c, user, password)
-                submitted = True
-                continue
-            if st.get("login") and submitted:
-                back += 1
-                if back >= 3:
-                    base.eprint("RESULT: the login form came back after the submit (wrong credentials, or the portal did not let a headless browser through: read what it says)" + (f" (it says: {st.get('errors')})" if st.get("errors") else " (no message shown)") + ".")
-                    result = 4
-                    break
-            else:
-                back = 0
-            if "online24.medicover.pl" == st.get("host") and not st.get("login"):
-                found = c.js(base.FIND)
-                if found:
-                    base.eprint("RESULT: signed in without the emailed code; a session exists.")
-                    if args.dry:
-                        result = 0
-                        break
-                    sess = json.loads(base.session_of_cdp(c, json.loads(found)["t"]))
-                    result = base.deliver(json.dumps(sess), args)
-                    break
-        else:
-            base.eprint("RESULT: timed out before a session or a refusal.")
-        c.close()
-    finally:
-        base.close_chrome_port(chrome, PORT)
-        shutil.rmtree(tmp, ignore_errors=True)
-        password = ""   # noqa: F841
-    return result
+    status, session = run_login(user, password, dk, args.timeout)
+    password = ""   # noqa: F841
+    messages = {"ok": "RESULT: signed in without the emailed code; a session exists.",
+                "code": "RESULT: the portal asks for the emailed code on this fresh profile (trust did not carry over).",
+                "rejected": "RESULT: the login form came back after the submit (wrong credentials, or the portal did not let a headless browser through).",
+                "timeout": "RESULT: timed out before a session or a refusal."}
+    base.eprint(messages[status])
+    if status != "ok":
+        return {"code": 3, "rejected": 4}.get(status, 1)
+    if args.dry:
+        return 0
+    return base.deliver(json.dumps(session), args)
 
 
 if __name__ == "__main__":
