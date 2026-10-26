@@ -118,6 +118,15 @@ STAGE_JS = """(() => { const q = (s) => document.querySelector(s);
     errors: (document.body.innerText || '').split('\\n').map(x => x.trim()).filter(x => x && x.length < 140 && /incorrect|oops|try again|invalid|error|nieprawid|b\u0142\u0105d|blocked|captcha|too many|locked|zablok/i.test(x)).slice(0,4)}); })()"""
 
 
+def fill_code_and_submit(c: Cdp, code: str) -> None:
+    """The emailed-code page: type the code, TICK 'trust this device' (so the next login from this device key needs only the password) and submit."""
+    c.js("(() => { const e = document.querySelector('input[name=\"Input.MfaCode\"]'); e.focus(); e.value = ''; })()")
+    c.call("Input.insertText", {"text": code})
+    time.sleep(0.4)
+    c.js("""(() => { const box = document.querySelector('input[name="Input.IsTrustedDevice"][type=checkbox]'); if (box && !box.checked) box.click();
+      const f = document.querySelector('input[name="Input.MfaCode"]').form; const b = f.querySelector('button[type=submit], input[type=submit], button[name="Input.Button"]'); b ? b.click() : f.requestSubmit(); })()""")
+
+
 def fill_and_submit(c: Cdp, user: str, password: str) -> None:
     """Type into the portal's own form like a person does: focus the field, insert the text, then press the form's submit button."""
     for name, value in (("Input.Username", user), ("Input.Password", password)):
@@ -127,10 +136,13 @@ def fill_and_submit(c: Cdp, user: str, password: str) -> None:
     c.js("(() => { const f = document.querySelector('input[name=\"Input.Password\"]').form; const b = f.querySelector('button[type=submit], input[type=submit], button[name=\"Input.Button\"]'); b ? b.click() : f.requestSubmit(); })()")
 
 
-def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=base.eprint) -> tuple[str, dict | None]:
+def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=base.eprint,
+              code_provider=None, code_wait: int = 480, on_code_page=None) -> tuple[str, dict | None]:
     """Log in once in a fresh headless Chrome. Returns (status, session): status is 'ok' (session = the JSON the server stores),
     'code' (the portal asks for the emailed code), 'rejected' (the form came back after the submit: wrong password, or refused) or
-    'timeout'. Nothing secret is printed."""
+    'timeout'. With a `code_provider` (a callable returning the six digits once they exist, else None) the emailed-code page is not the end:
+    the browser stays open for up to `code_wait` seconds, types the code, ticks 'trust this device' and goes on; `on_code_page()` is called once
+    when the page appears. Without one, or when no code arrives in time, the status is 'code'. Nothing secret is printed."""
     tmp = Path(tempfile.mkdtemp(prefix="medicover-headless-"))
     chrome = launch(tmp, PORT, "about:blank")
     status, session = "timeout", None
@@ -142,6 +154,7 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
             c.call("Page.addScriptToEvaluateOnNewDocument", {"source": f"if (location.origin === {json.dumps(SPA)} && !localStorage.getItem('deviceKey')) localStorage.setItem('deviceKey', {json.dumps(dk)});"})
         c.call("Page.navigate", {"url": SPA + "/"})
         submitted, last, back, deadline = False, None, 0, time.monotonic() + timeout
+        announced, code_sent, code_deadline, mfa_after_code = False, False, None, 0
         while time.monotonic() < deadline:
             time.sleep(1.5)
             try:
@@ -153,8 +166,29 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
                 say(f"[stage] {st.get('host')}{st.get('path')}  login-form={st.get('login')}  code-page={st.get('mfa')}  portal-says={st.get('errors') or '-'}")
                 last = stage
             if st.get("mfa"):
-                status = "code"
-                break
+                if code_provider is None:
+                    status = "code"
+                    break
+                if not announced:
+                    announced, code_deadline = True, time.monotonic() + code_wait
+                    deadline = max(deadline, code_deadline + 60)
+                    if on_code_page:
+                        on_code_page()
+                if code_sent:
+                    mfa_after_code += 1
+                    if mfa_after_code >= 4:       # the page came back after the code: the portal did not accept it
+                        status = "code"
+                        break
+                    continue
+                code = code_provider()
+                if code:
+                    fill_code_and_submit(c, code)
+                    code_sent = True
+                    continue
+                if time.monotonic() > code_deadline:
+                    status = "code"
+                    break
+                continue
             if st.get("login") and not submitted:
                 fill_and_submit(c, user, password)
                 submitted = True
@@ -190,6 +224,8 @@ def main() -> int:
     p.add_argument("--profile", default="~/.medicover-chrome", help="persistent profile to take the trusted device key from")
     p.add_argument("--device-key", help="use this device key instead of reading the profile")
     p.add_argument("--timeout", type=int, default=150)
+    p.add_argument("--ask-code", action="store_true", help="if the portal asks for the emailed code, ask for it here (it is typed with 'trust this device' ticked)")
+    p.add_argument("--new-device", action="store_true", help="log in as a BRAND-NEW device (a fresh key, printed so you can reuse it with --device-key)")
     args = p.parse_args()
 
     user = os.environ.get("MEDICOVER_USERNAME") or input("Medicover username (MRN / login): ").strip()
@@ -197,10 +233,24 @@ def main() -> int:
     if not user or not password:
         base.eprint("username and password are required")
         return 2
-    dk = args.device_key or trusted_device_key(Path(args.profile).expanduser())
-    base.eprint("trusted device key:", "found" if dk else "NOT found (the portal will treat this as a new device)")
+    if args.new_device:
+        import uuid
+        dk = str(uuid.uuid4())
+        base.eprint("NEW device key (use it again with --device-key to test that the password alone is enough next time):", dk)
+    else:
+        dk = args.device_key or trusted_device_key(Path(args.profile).expanduser())
+        base.eprint("trusted device key:", "found" if dk else "NOT found (the portal will treat this as a new device)")
 
-    status, session = run_login(user, password, dk, args.timeout)
+    asked = {"done": False}
+
+    def provider():
+        if asked["done"]:
+            return None
+        asked["done"] = True
+        return input("The portal e-mailed you a code. Type it here: ").strip() or None
+
+    status, session = run_login(user, password, dk, args.timeout + (300 if args.ask_code else 0),
+                                code_provider=provider if args.ask_code else None)
     password = ""   # noqa: F841
     messages = {"ok": "RESULT: signed in without the emailed code; a session exists.",
                 "code": "RESULT: the portal asks for the emailed code on this fresh profile (trust did not carry over).",

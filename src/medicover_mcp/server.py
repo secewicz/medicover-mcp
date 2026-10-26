@@ -10,7 +10,11 @@ token-lifetime decision in NOTES.md. Expiry surfaces as a clear "run `medicover-
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
@@ -41,14 +45,13 @@ def _get_client() -> MedicoverClient:
     return _client
 
 
-def _require_confirmation(tool: str, confirm: bool) -> None:
+def _require_confirmation(tool: str, confirm: bool, what: str = "changes a real medical appointment") -> None:
     """Write gate (fork change). The text starts with CONFIRMATION REQUIRED because the lab's
     mcp-hub guard recognises that phrase and refunds the write-budget slot for such a reply."""
     if confirm is not True:
         raise RuntimeError(
-            f"CONFIRMATION REQUIRED: {tool} changes a real medical appointment. Show the human "
-            "the patient, doctor, clinic and time, and call again with confirm=true only after "
-            "they approve this exact change."
+            f"CONFIRMATION REQUIRED: {tool} {what}. Show the human what is about to happen "
+            "and call again with confirm=true only after they approve it."
         )
 
 
@@ -352,6 +355,80 @@ async def reschedule_appointment(
         raise
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(_friendly(exc)) from exc
+
+
+# --- login hand-off (fork change): the hub's renewer may stop at the portal's emailed-code page -----------------------------
+
+_LOGIN_MESSAGES = {
+    "ok": "The login works.",
+    "renewing": "The hub is logging in again right now; check again in a minute.",
+    "awaiting_code": "The portal sent an emailed code. Ask the person for the digits and call submit_login_code before the deadline.",
+    "blocked_password": "The portal rejected the stored password. Nothing will retry until the password in SOPS is changed.",
+    "blocked_code": "The portal asked for an emailed code and none arrived in time. The renewer tries again within an hour.",
+    "blocked_repeated": "The renewer failed several times in a row and is paused for a few hours.",
+    "waiting": "The login is down; the renewer is waiting out its attempt limit.",
+    "unreachable": "This instance could not be reached by the renewer.",
+}
+
+
+def _login_state() -> dict:
+    path = os.environ.get("MEDICOVER_STATUS_FILE")
+    try:
+        data = json.loads(Path(path).read_text()) if path else {}
+    except (OSError, ValueError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+@mcp.tool(annotations=_READ_ONLY)
+async def login_status() -> dict:
+    """What the hub's login renewer is doing for THIS account: ok, renewing, awaiting_code, blocked_*, waiting.
+
+    Cheap: it reads a status file and does not call the portal. When it says `awaiting_code`, the portal has e-mailed a code to the
+    person and the hub's browser is waiting for it until `deadline` (unix seconds): get the digits from the person and call
+    submit_login_code. Read-only.
+    """
+    st = _login_state()
+    state = st.get("state") or "unknown"
+    deadline = st.get("deadline")
+    live = state == "awaiting_code" and isinstance(deadline, (int, float)) and deadline > time.time()
+    return {
+        "state": state if (state != "awaiting_code" or live) else "blocked_code",
+        "message": _LOGIN_MESSAGES.get(state, "No status yet: the renewer has not run for this account."),
+        "can_submit_code": bool(live),
+        "seconds_left": int(deadline - time.time()) if live else 0,
+        "updated": st.get("updated"),
+    }
+
+
+@mcp.tool()
+async def submit_login_code(
+    code: Annotated[str, Field(description="The 4 to 8 digit code the portal e-mailed to the person. Digits only.")],
+    confirm: Annotated[
+        bool,
+        Field(description="Must be true. Leave false until the person has given you the code in this conversation."),
+    ] = False,
+) -> dict:
+    """Hand the e-mailed login code to the hub's waiting browser (only when login_status says awaiting_code).
+
+    The browser types it, ticks 'trust this device' so later logins need only the password, and stores the new session. The code is
+    useless without the password that only the hub holds. Check login_status again after a few seconds.
+    """
+    _require_confirmation("submit_login_code", confirm, "hands a login code to the hub's browser")
+    digits = code.strip()
+    if not (digits.isdigit() and 4 <= len(digits) <= 8):
+        raise RuntimeError("the code must be 4 to 8 digits and nothing else")
+    st = _login_state()
+    deadline = st.get("deadline")
+    if st.get("state") != "awaiting_code" or not isinstance(deadline, (int, float)) or deadline <= time.time():
+        raise RuntimeError("no code is being waited for right now (login_status says " + str(st.get("state") or "unknown") + ")")
+    target = _settings.store_path.parent / "pending-code.txt"
+    tmp = target.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(digits)
+    os.replace(tmp, target)
+    return {"submitted": True, "message": "The code was handed to the browser. Check login_status in a few seconds."}
 
 
 def main() -> None:

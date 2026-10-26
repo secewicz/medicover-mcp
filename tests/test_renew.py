@@ -39,11 +39,15 @@ def test_a_rejected_password_blocks_and_only_a_changed_secret_lifts_it():
     assert state["blocked"] is None
 
 
-def test_the_emailed_code_blocks_the_same_way():
+def test_a_code_that_never_came_blocks_for_an_hour_and_a_changed_secret_lifts_it_at_once():
     state = {}
     renew.apply_result(state, "code", 10.0, H)
     assert renew.decide(state, 20.0, H) == ("blocked", "code")
-    assert renew.decide(state, 20.0, "hash-b")[0] == "go"
+    assert renew.decide(state, 20.0 + 1800, H) == ("blocked", "code")
+    assert renew.decide(state, 10.0 + 3601, H)[0] == "go"                  # an hour later: one new attempt (and one new email)
+    state2 = {}
+    renew.apply_result(state2, "code", 10.0, H)
+    assert renew.decide(state2, 20.0, "hash-b")[0] == "go"
 
 
 def test_three_plain_failures_block_for_six_hours_only():
@@ -98,3 +102,23 @@ def test_env_values_accept_base64_so_any_password_survives_the_env_file(monkeypa
     assert renew.env_value("MEDICOVER_PASSWORD") == ""
     monkeypatch.delenv("MEDICOVER_PASSWORD_B64")
     assert renew.env_value("MEDICOVER_PASSWORD") == "ignored"
+
+
+def test_take_code_reads_digits_once_and_deletes_the_file(tmp_path):
+    f = tmp_path / "pending-code.txt"
+    f.write_text(" 123456\n")
+    assert renew.take_code(f) == "123456" and not f.exists()
+    assert renew.take_code(f) is None
+    for bad in ("12", "12ab56", "123456789", "1 2 3"):
+        f.write_text(bad)
+        assert renew.take_code(f) is None and not f.exists(), bad
+
+
+def test_the_status_file_is_public_and_holds_no_secret(tmp_path):
+    import stat
+    path = tmp_path / "run" / "status.json"
+    renew.write_status(str(path), "filip", "awaiting_code", deadline=123)
+    d = json.loads(path.read_text())
+    assert d["state"] == "awaiting_code" and d["deadline"] == 123 and d["account"] == "filip"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    renew.write_status(None, "filip", "ok")            # no path: silently nothing

@@ -139,11 +139,66 @@ async def test_search_slots_forwards_search_type(fake_client):
 async def test_read_tools_are_hinted_read_only_and_writes_are_not():
     tools = {t.name: t for t in await server.mcp.list_tools()}
     reads = {"list_patients", "list_appointments", "list_appointment_filters",
-             "list_search_filters", "search_slots"}
-    writes = {"book_appointment", "reschedule_appointment"}
+             "list_search_filters", "search_slots", "login_status"}
+    writes = {"book_appointment", "reschedule_appointment", "submit_login_code"}
     assert set(tools) == reads | writes
     for name in reads:
         assert tools[name].annotations is not None and tools[name].annotations.readOnlyHint is True
     for name in writes:
         assert not (tools[name].annotations and tools[name].annotations.readOnlyHint)
         assert "confirm" in tools[name].inputSchema["properties"]
+
+
+# --- login hand-off ------------------------------------------------------------------------------
+
+
+def _status(tmp_path, monkeypatch, **fields):
+    import json
+    from medicover_mcp import config
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps(fields))
+    monkeypatch.setenv("MEDICOVER_STATUS_FILE", str(path))
+    monkeypatch.setattr(server, "_settings", config.Settings(store_path=tmp_path / "creds.json", request_timeout=5, username=None, password=None))
+
+
+async def test_login_status_reports_the_waiting_code_and_how_long_is_left(tmp_path, monkeypatch):
+    import time
+    _status(tmp_path, monkeypatch, state="awaiting_code", deadline=int(time.time()) + 300, updated=1)
+    out = await server.login_status()
+    assert out["state"] == "awaiting_code" and out["can_submit_code"] is True and 250 < out["seconds_left"] <= 300
+
+
+async def test_an_expired_wait_is_reported_as_no_longer_possible(tmp_path, monkeypatch):
+    import time
+    _status(tmp_path, monkeypatch, state="awaiting_code", deadline=int(time.time()) - 5)
+    out = await server.login_status()
+    assert out["can_submit_code"] is False and out["state"] == "blocked_code"
+
+
+async def test_login_status_without_a_file_says_so(monkeypatch):
+    monkeypatch.delenv("MEDICOVER_STATUS_FILE", raising=False)
+    out = await server.login_status()
+    assert out["state"] == "unknown" and out["can_submit_code"] is False
+
+
+async def test_submit_login_code_needs_confirm_and_digits_and_a_waiting_browser(tmp_path, monkeypatch):
+    import time
+    _status(tmp_path, monkeypatch, state="awaiting_code", deadline=int(time.time()) + 300)
+    with pytest.raises(RuntimeError, match="CONFIRMATION REQUIRED"):
+        await server.submit_login_code("123456")
+    assert not (tmp_path / "pending-code.txt").exists()
+    for bad in ("12", "abcdef", "12 34 56", "123456789", ""):
+        with pytest.raises(RuntimeError, match="4 to 8 digits"):
+            await server.submit_login_code(bad, confirm=True)
+    out = await server.submit_login_code(" 123456 ", confirm=True)
+    f = tmp_path / "pending-code.txt"
+    assert out["submitted"] is True and f.read_text() == "123456"
+    import stat
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+
+
+async def test_submit_login_code_refuses_when_nothing_waits(tmp_path, monkeypatch):
+    _status(tmp_path, monkeypatch, state="ok")
+    with pytest.raises(RuntimeError, match="no code is being waited for"):
+        await server.submit_login_code("123456", confirm=True)
+    assert not (tmp_path / "pending-code.txt").exists()
