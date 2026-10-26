@@ -97,6 +97,22 @@ def cdp_call(ws_url: str, method: str, params: dict | None = None):
                 return msg.get("result", {})
 
 
+def persist_login_cookie(ws_url: str, days: int) -> list[str]:
+    """The portal's sign-in cookie (idsrv*) is a SESSION cookie: Chrome drops it on quit, so every run starts signed out and asks for the
+    password again (seen 26 Oct 2026 with --diagnose). Re-set it with an expiry so the profile stays signed in, like a 'remember me'.
+    Values stay in this process: only the NAMES are returned."""
+    done = []
+    for c in cdp_call(ws_url, "Network.getAllCookies").get("cookies", []):
+        if c.get("session") and "login-online24.medicover.pl" in c.get("domain", "") and c.get("name", "").lower().startswith("idsrv"):
+            params = {k: c[k] for k in ("name", "value", "domain", "path", "secure", "httpOnly") if k in c}
+            if c.get("sameSite") in ("Strict", "Lax", "None"):
+                params["sameSite"] = c["sameSite"]
+            params["expires"] = time.time() + days * 86400
+            if cdp_call(ws_url, "Network.setCookie", params).get("success"):
+                done.append(c["name"])
+    return done
+
+
 STORAGE_KEYS = "JSON.stringify({local: Object.keys(localStorage), session: Object.keys(sessionStorage)})"
 
 
@@ -144,6 +160,7 @@ def main() -> int:
     p.add_argument("--restart", action="store_true", help="restart the account's instance after delivery (with --hub)")
     p.add_argument("--profile", default="~/.medicover-chrome", help="Chrome profile directory kept between runs")
     p.add_argument("--diagnose", action="store_true", help="print what the Chrome profile remembers (cookie names/expiry, storage key names; never values)")
+    p.add_argument("--keep-days", type=int, default=30, help="keep the portal's sign-in cookie in the profile this long (0 = do not)")
     p.add_argument("--timeout", type=int, default=600, help="seconds to wait for the login")
     args = p.parse_args()
 
@@ -175,6 +192,9 @@ def main() -> int:
                             if args.diagnose:
                                 diagnose("at the moment of login", t["webSocketDebuggerUrl"])
                             token = json.loads(found)["t"]
+                            if args.keep_days > 0:
+                                kept = persist_login_cookie(t["webSocketDebuggerUrl"], args.keep_days)
+                                eprint(f"Kept the portal's sign-in cookie in the profile for {args.keep_days} days: {kept}")
                             evaluate(t["webSocketDebuggerUrl"], WIPE)   # the browser must not refresh a token the server owns
                             break
                     except Exception:
