@@ -146,6 +146,33 @@ def session_of(ws_url: str, refresh_token: str) -> str:
     return json.dumps({"cookies": cookies, "device_id": device, "refresh_token": refresh_token})
 
 
+def close_chrome_port(chrome: subprocess.Popen, port: int) -> None:
+    """close_chrome for a Chrome on another debugging port (used by the headless experiment)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as r:
+            browser_ws = json.load(r)["webSocketDebuggerUrl"]
+        with connect(browser_ws, open_timeout=3) as ws:
+            ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+    except Exception:
+        pass
+    try:
+        chrome.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(chrome.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def session_of_cdp(c, refresh_token: str) -> str:
+    """session_of for an already-open CDP connection (objects with .call and .js): same JSON, same child-stdin-only rule."""
+    cookies = {}
+    for ck in c.call("Network.getAllCookies").get("cookies", []):
+        if "login-online24.medicover.pl" in ck.get("domain", "") and (ck.get("name", "").lower().startswith("idsrv") or ck.get("name") == "cookiesession1"):
+            cookies[ck["name"]] = ck["value"]
+    return json.dumps({"cookies": cookies, "device_id": c.js("localStorage.getItem('deviceKey')") or None, "refresh_token": refresh_token})
+
+
 def deliver(token: str, args: argparse.Namespace) -> int:
     if args.local:
         cmd = ["uv", "run", "--quiet", "medicover-auth", "set-session"]
