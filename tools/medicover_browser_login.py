@@ -88,6 +88,35 @@ def close_chrome(chrome: subprocess.Popen) -> None:
             pass
 
 
+def cdp_call(ws_url: str, method: str, params: dict | None = None):
+    with connect(ws_url, max_size=2**23, open_timeout=3) as ws:
+        ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+        while True:
+            msg = json.loads(ws.recv(timeout=5))
+            if msg.get("id") == 1:
+                return msg.get("result", {})
+
+
+STORAGE_KEYS = "JSON.stringify({local: Object.keys(localStorage), session: Object.keys(sessionStorage)})"
+
+
+def diagnose(label: str, ws_url: str) -> None:
+    """--diagnose: what the profile REMEMBERS. Cookie names, domains, session-or-persistent and expiry; storage KEY NAMES. Never a value."""
+    try:
+        cookies = cdp_call(ws_url, "Network.getAllCookies").get("cookies", [])
+        keys = json.loads(evaluate(ws_url, STORAGE_KEYS) or "{}")
+    except Exception as exc:
+        eprint(f"[diagnose {label}] failed: {type(exc).__name__}")
+        return
+    eprint(f"[diagnose {label}] {len(cookies)} cookies")
+    for c in sorted(cookies, key=lambda c: (c.get("domain", ""), c.get("name", ""))):
+        if "medicover" not in c.get("domain", ""):
+            continue
+        exp = "SESSION (dropped when Chrome quits)" if c.get("session") else time.strftime("expires %Y-%m-%d %H:%M UTC", time.gmtime(c.get("expires", 0)))
+        eprint(f"   cookie {c.get('name','')[:40]:40} {c.get('domain',''):34} {exp}")
+    eprint(f"   storage keys: local={[k[:60] for k in keys.get('local', [])]} session={[k[:60] for k in keys.get('session', [])]}")
+
+
 def deliver(token: str, args: argparse.Namespace) -> int:
     if args.local:
         cmd = ["uv", "run", "--quiet", "medicover-auth", "set-token", "--stdin"]
@@ -114,6 +143,7 @@ def main() -> int:
     p.add_argument("--account", default="filip", help="hub account label (with --hub)")
     p.add_argument("--restart", action="store_true", help="restart the account's instance after delivery (with --hub)")
     p.add_argument("--profile", default="~/.medicover-chrome", help="Chrome profile directory kept between runs")
+    p.add_argument("--diagnose", action="store_true", help="print what the Chrome profile remembers (cookie names/expiry, storage key names; never values)")
     p.add_argument("--timeout", type=int, default=600, help="seconds to wait for the login")
     args = p.parse_args()
 
@@ -129,14 +159,21 @@ def main() -> int:
     eprint("Chrome is open. Log in to Medicover there (password, the emailed code, tick 'trust this device'). Nothing to copy.")
     token = None
     deadline = time.monotonic() + args.timeout
+    diagnosed_start = False
     try:
         while time.monotonic() < deadline and token is None:
             time.sleep(1)
             for t in targets():
                 if t.get("type") == "page" and HOST in t.get("url", "") and t.get("webSocketDebuggerUrl"):
                     try:
+                        if args.diagnose and not diagnosed_start:
+                            time.sleep(3)   # let the page load and the SPA decide whether it is signed in
+                            diagnose("when Chrome opened", t["webSocketDebuggerUrl"])
+                            diagnosed_start = True
                         found = evaluate(t["webSocketDebuggerUrl"], FIND)
                         if found:
+                            if args.diagnose:
+                                diagnose("at the moment of login", t["webSocketDebuggerUrl"])
                             token = json.loads(found)["t"]
                             evaluate(t["webSocketDebuggerUrl"], WIPE)   # the browser must not refresh a token the server owns
                             break
