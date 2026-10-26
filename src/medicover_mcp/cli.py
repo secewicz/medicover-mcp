@@ -96,7 +96,7 @@ def _jwt_sub(token: str) -> int | None:
         return None
 
 
-def cmd_set_token(settings: config.Settings) -> int:
+def cmd_set_token(settings: config.Settings, from_stdin: bool = False) -> int:
     """Bootstrap by pasting a refresh token captured from a logged-in browser session.
 
     Get it from your browser's devtools while logged in to online24.medicover.pl:
@@ -104,11 +104,15 @@ def cmd_set_token(settings: config.Settings) -> int:
     (or paste the whole JSON value). NB: the refresh token rotates on use, so do this promptly.
     """
     store = CredentialStore(settings.store_path)
-    _eprint(
-        "Paste your refresh token (or the whole `oidc.user:...` JSON from the browser's\n"
-        "Local/Session Storage), then press Enter. Input is hidden:"
-    )
-    rt = _extract_refresh_token(getpass.getpass(""))
+    if from_stdin:
+        # Fork change: tools/medicover_browser_login.py pipes the token in, so nobody has to paste it against the clock.
+        rt = _extract_refresh_token(sys.stdin.readline())
+    else:
+        _eprint(
+            "Paste your refresh token (or the whole `oidc.user:...` JSON from the browser's\n"
+            "Local/Session Storage), then press Enter. Input is hidden:"
+        )
+        rt = _extract_refresh_token(getpass.getpass(""))
     if not rt:
         _eprint("error: no refresh token found in input")
         return 2
@@ -186,10 +190,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="medicover-auth", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("login", help="interactive login + SMS 2FA; persist the refresh token")
-    sub.add_parser(
+    st = sub.add_parser(
         "set-token",
         help="bootstrap by pasting a refresh token from a logged-in browser session",
     )
+    st.add_argument("--stdin", action="store_true", help="read the token from the first line of stdin instead of prompting")
     sub.add_parser("status", help="show whether credentials are stored (no secrets shown)")
     sub.add_parser("logout", help="delete the stored credentials")
     args = parser.parse_args(argv)
@@ -198,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "login":
         return cmd_login(settings)
     if args.command == "set-token":
-        return cmd_set_token(settings)
+        return cmd_set_token(settings, from_stdin=args.stdin)
     if args.command == "status":
         return cmd_status(settings)
     if args.command == "logout":
