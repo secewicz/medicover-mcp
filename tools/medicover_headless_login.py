@@ -181,6 +181,19 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
         c.call("Network.setUserAgentOverride", {"userAgent": HEADLESS_UA})
         if dk:
             c.call("Page.addScriptToEvaluateOnNewDocument", {"source": f"if (location.origin === {json.dumps(SPA)} && !localStorage.getItem('deviceKey')) localStorage.setItem('deviceKey', {json.dumps(dk)});"})
+        if profile is not None:
+            # A persistent profile still holds the SPA's token from the last run, which the server has since rotated: the page would look signed in
+            # and hand over a refresh token that is already dead (invalid_grant). Remove only those oidc.user:* entries (the device key and everything
+            # else the portal remembers stay), on a static page of the SPA's origin so no app code runs, then load the app, which must sign in again.
+            c.call("Page.navigate", {"url": SPA + "/robots.txt"})
+            for _ in range(20):
+                time.sleep(0.5)
+                try:
+                    if json.loads(c.js("JSON.stringify(location.origin)")) == SPA:
+                        break
+                except Exception:
+                    continue
+            say(f"[profile] stale portal tokens removed: {c.js(base.WIPE)}")
         c.call("Page.navigate", {"url": SPA + "/"})
         submitted, last, back, deadline = False, None, 0, time.monotonic() + timeout
         announced, code_sent, code_deadline, mfa_after_code = False, False, None, 0
