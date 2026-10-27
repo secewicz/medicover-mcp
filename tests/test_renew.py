@@ -39,12 +39,12 @@ def test_a_rejected_password_blocks_and_only_a_changed_secret_lifts_it():
     assert state["blocked"] is None
 
 
-def test_a_code_that_never_came_blocks_for_an_hour_and_a_changed_secret_lifts_it_at_once():
+def test_the_code_page_blocks_for_good_and_only_a_changed_secret_lifts_it():
     state = {}
     renew.apply_result(state, "code", 10.0, H)
+    assert "until" not in state["blocked"]
     assert renew.decide(state, 20.0, H) == ("blocked", "code")
-    assert renew.decide(state, 20.0 + 1800, H) == ("blocked", "code")
-    assert renew.decide(state, 10.0 + 3601, H)[0] == "go"                  # an hour later: one new attempt (and one new email)
+    assert renew.decide(state, 20.0 + 30 * 86400, H) == ("blocked", "code")     # a month later: still nothing, so no hourly e-mails
     state2 = {}
     renew.apply_result(state2, "code", 10.0, H)
     assert renew.decide(state2, 20.0, "hash-b")[0] == "go"
@@ -128,3 +128,66 @@ def test_a_code_the_portal_did_not_accept_blocks_like_a_code_that_never_came():
     state = {}
     renew.apply_result(state, "code_rejected", 10.0, H)
     assert state["blocked"]["reason"] == "code" and renew.decide(state, 20.0, H) == ("blocked", "code")
+
+
+# --- main() with a fake browser: the two modes ---------------------------------------------------------------------------------------
+
+def _run(tmp_path, monkeypatch, *, enrol, alive, login, state=None, capsys=None):
+    """Run main() once. `login(kwargs)` plays the browser; it returns (status, session)."""
+    import sys
+    import types
+    calls = []
+    fake = types.ModuleType("medicover_headless_login")
+
+    def run_login(user, password, dk, timeout, **kw):
+        calls.append(kw)
+        return login(kw)
+    fake.run_login = run_login
+    monkeypatch.setitem(sys.modules, "medicover_headless_login", fake)
+    monkeypatch.setattr(renew, "alive", lambda port: _const(alive))
+    monkeypatch.setattr(renew, "deliver", lambda *a: True)
+    monkeypatch.setenv("MEDICOVER_USERNAME", "u")
+    monkeypatch.setenv("MEDICOVER_PASSWORD", "p")
+    monkeypatch.setenv("MEDICOVER_STORE_PATH", str(tmp_path / "creds.json"))
+    monkeypatch.setenv("MEDICOVER_STATUS_FILE", str(tmp_path / "status.json"))
+    sf = tmp_path / "renewal.json"
+    if state is not None:
+        sf.write_text(json.dumps(state))
+    code = renew.main(["--account", "a", "--port", "1", "--state-file", str(sf)] + (["--enrol"] if enrol else []))
+    return code, calls, json.loads(sf.read_text()), json.loads((tmp_path / "status.json").read_text())
+
+
+async def _const(v):
+    return v
+
+
+def test_a_never_enrolled_account_does_not_try_the_password(tmp_path, monkeypatch):
+    code, calls, state, status = _run(tmp_path, monkeypatch, enrol=False, alive=False, login=lambda kw: ("ok", {}))
+    assert code == renew.EXIT_CODE and calls == [] and status["state"] == "needs_enrolment"
+
+
+def test_a_scheduled_run_never_waits_for_a_code_and_a_code_page_blocks_it_for_good(tmp_path, monkeypatch):
+    code, calls, state, status = _run(tmp_path, monkeypatch, enrol=False, alive=False, state={"enrolled": True}, login=lambda kw: ("code", None))
+    assert calls[0]["code_provider"] is None and calls[0]["on_code_page"] is None
+    assert code == renew.EXIT_CODE and status["state"] == "blocked_code" and "until" not in state["blocked"]
+    again = _run(tmp_path, monkeypatch, enrol=False, alive=False, login=lambda kw: (_ for _ in ()).throw(AssertionError("must not log in")))
+    assert again[0] == renew.EXIT_CODE and again[1] == []                      # the next timer run does not touch the portal
+
+
+def test_enrol_waits_for_the_code_lifts_the_block_and_marks_the_device_enrolled(tmp_path, monkeypatch):
+    blocked = {"enrolled": True, "blocked": {"reason": "code", "secret": "x", "at": 1.0}}
+    code, calls, state, status = _run(tmp_path, monkeypatch, enrol=True, alive=True, state=blocked, login=lambda kw: ("ok", {"s": 1}))
+    assert callable(calls[0]["code_provider"]) and callable(calls[0]["on_code_page"])
+    assert code == 0 and state["enrolled"] is True and state["blocked"] is None and status["state"] == "ok"
+
+
+def test_enrol_is_limited_to_three_a_day(tmp_path, monkeypatch):
+    import time
+    now = time.time()
+    code, calls, state, status = _run(tmp_path, monkeypatch, enrol=True, alive=False, state={"enrol_attempts": [now - 60, now - 120, now - 180]}, login=lambda kw: ("ok", {}))
+    assert calls == [] and status["state"] == "waiting"
+
+
+def test_every_login_uses_the_persistent_profile_next_to_the_state_file(tmp_path, monkeypatch):
+    _, calls, _, _ = _run(tmp_path, monkeypatch, enrol=False, alive=False, state={"enrolled": True}, login=lambda kw: ("timeout", None))
+    assert calls[0]["profile"] == tmp_path / "chrome"

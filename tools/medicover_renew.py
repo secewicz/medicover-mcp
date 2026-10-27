@@ -2,27 +2,34 @@
 """Unattended renewal of ONE account's Medicover login (ADR-085). Run by a timer on the hub as that account's own user.
 
 Each run: (1) ask the account's own server instance, over loopback, whether the login works; if it does, there is nothing to do. (2) if
-it does not, and the safety rules below allow it, log in once in a fresh headless Chrome with the account's password and trusted-device key
-(from the environment, which systemd fills from a root-owned 0600 file that the deploy writes from SOPS), and store the session with
+it does not, and the safety rules below allow it, log in once in the account's own PERSISTENT headless Chrome profile with the password (from the
+environment, which systemd fills from a root-owned 0600 file that the deploy writes from SOPS), and store the session with
 `medicover-auth set-session`. (3) verify that it worked.
+
+TWO MODES. The scheduled run (every few minutes) only ever logs in with the password and NEVER waits for or asks for a code. `--enrol` is the one
+supervised step, started by hand (`systemctl start mcp-hub-medicover-enrol@NAME`): the portal e-mails a code, a person hands it over with the MCP
+tool `submit_login_code`, it is typed with 'trust this device' ticked, and the portal's trust lands in the persistent profile. From then on the
+scheduled run needs only the password, for as long as the portal keeps that trust (months). A scheduled run that is shown the code page anyway
+(the trust expired or was lost) STOPS: it blocks, alerts once, and sends no more mails until a person runs `--enrol` again.
 
 SAFETY RULES, because a wrong password retried in a loop locks a real person out of their medical portal:
   * at most one browser login per 10 minutes and six per 24 hours;
   * a rejected password BLOCKS the account (no more attempts) until the password or device key in SOPS changes (the block remembers a hash
     of them, never the values), or the login is delivered some other way and found alive;
-  * the portal asking for the emailed code does NOT block at once: the browser waits (default 8 minutes) for the six digits, which Hermes or
-    Claude hand over with the MCP tool `submit_login_code` (it drops them in `pending-code.txt` next to this state file). The code is typed with
-    'trust this device' ticked, so the next login from this device key needs only the password. No code in time: blocked for an hour;
+  * a scheduled run is shown the emailed-code page: BLOCKED (the mail is already sent; nothing is retried) until `--enrol` runs or the password
+    or device key in SOPS changes. An account that was never enrolled does not even try the password: it reports `needs_enrolment`;
+  * `--enrol` waits (default 8 minutes) for the six digits (the MCP tool `submit_login_code` drops them in `pending-code.txt` next to the state
+    file), at most 3 times in 24 hours; no code in time: blocked as above;
   * three failures in a row (timeouts, crashes) block it for six hours.
 
 The device key it logs in with is, in this order: the one it remembered after its last success (`device_key` in the state), the one in SOPS,
 or a new one it makes up and remembers: the hub registers ITSELF as a trusted device.
 
-EXIT CODES: 0 = alive, renewed, waiting out a limit, or the instance is not reachable (nothing to renew); 3 = blocked: the portal wanted the
-emailed code and none came; 4 = blocked: the password was rejected; 5 = blocked: repeated failures. A non-zero exit leaves the systemd unit FAILED, which
+EXIT CODES: 0 = alive, renewed, waiting out a limit, or the instance is not reachable (nothing to renew); 3 = blocked: the portal wants the
+emailed code (or the account was never enrolled); 4 = blocked: the password was rejected; 5 = blocked: repeated failures. A non-zero exit leaves the systemd unit FAILED, which
 the hub's check turns into the Kuma monitor `mcp-hub medicover renewal` going DOWN (and Slack). Nothing secret is printed.
 
-    medicover_renew.py --account filip --port 9094 --state-file /var/lib/mcp-hub-medicover/filip/renewal.json
+    medicover_renew.py --account filip --port 9094 --state-file /var/lib/mcp-hub-medicover/filip/renewal.json [--enrol] [--profile-dir DIR]
 Environment: MEDICOVER_USERNAME, MEDICOVER_PASSWORD, MEDICOVER_DEVICE_KEY (each also as NAME_B64), MEDICOVER_STORE_PATH (and MEDICOVER_CHROME / MEDICOVER_CHROME_ARGS).
 """
 from __future__ import annotations
@@ -41,7 +48,7 @@ from pathlib import Path
 EXIT_CODE, EXIT_PASSWORD, EXIT_REPEATED = 3, 4, 5
 MIN_GAP = 600                 # seconds between two browser logins
 CODE_WAIT = 480               # seconds the browser waits for the emailed code
-CODE_BLOCK_SECONDS = 3600     # a code that never came: no new attempt (and no new email) for an hour
+ENROL_MAX = 3                 # supervised enrolments (each sends one e-mail) in any 24 hours
 DAILY_MAX = 6                 # browser logins in any 24 hours
 FAIL_BLOCK_AFTER = 3          # consecutive failures that are not a refusal
 FAIL_BLOCK_SECONDS = 6 * 3600
@@ -88,7 +95,7 @@ def decide(state: dict, now: float, secret: str) -> tuple[str, str]:
         reason = blocked.get("reason")
         if reason in ("password", "code") and blocked.get("secret") != secret:
             state["blocked"] = None                      # the password or key in SOPS changed: try again
-        elif reason in ("repeated", "code") and now >= blocked.get("until", 0):
+        elif reason == "repeated" and now >= blocked.get("until", 0):
             state["blocked"] = None
         else:
             return "blocked", reason
@@ -107,7 +114,7 @@ def apply_result(state: dict, status: str, now: float, secret: str) -> None:
     elif status == "rejected":
         state["blocked"] = {"reason": "password", "secret": secret, "at": now}
     elif status in ("code", "code_rejected"):
-        state["blocked"] = {"reason": "code", "secret": secret, "until": now + CODE_BLOCK_SECONDS, "at": now}
+        state["blocked"] = {"reason": "code", "secret": secret, "at": now}      # no expiry: only a person (`--enrol`) or new SOPS values lift it
     else:
         state["failures"] = state.get("failures", 0) + 1
         if state["failures"] >= FAIL_BLOCK_AFTER:
@@ -176,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--auth-bin", default="medicover-auth")
     p.add_argument("--timeout", type=int, default=150)
     p.add_argument("--code-wait", type=int, default=CODE_WAIT)
+    p.add_argument("--enrol", action="store_true", help="the supervised step: wait for the emailed code and register this device as trusted")
+    p.add_argument("--profile-dir", help="the persistent headless Chrome profile (default: 'chrome' next to the state file)")
     args = p.parse_args(argv)
 
     user, password, dk = (env_value(k) for k in ("MEDICOVER_USERNAME", "MEDICOVER_PASSWORD", "MEDICOVER_DEVICE_KEY"))
@@ -187,13 +196,14 @@ def main(argv: list[str] | None = None) -> int:
     state, secret = load_state(path), secret_hash(user, password, dk)
     status_path = os.environ.get("MEDICOVER_STATUS_FILE")
     code_file = path.parent / "pending-code.txt"
+    profile = Path(args.profile_dir) if args.profile_dir else path.parent / "chrome"
 
     is_alive = asyncio.run(alive(args.port))
     if is_alive is None:
         write_status(status_path, args.account, "unreachable")
         say(args.account, "the instance is not reachable; nothing to renew")
         return 0
-    if is_alive:
+    if is_alive and not args.enrol:          # an enrolment logs in even when the session lives: its job is to register the device
         if state.get("blocked") or state.get("failures"):
             state["blocked"], state["failures"] = None, 0
             save_state(path, state)
@@ -201,17 +211,32 @@ def main(argv: list[str] | None = None) -> int:
         say(args.account, "login alive")
         return 0
 
-    verdict, why = decide(state, now, secret)
-    if verdict == "blocked":
-        save_state(path, state)
-        write_status(status_path, args.account, "blocked_" + why, until=(state.get("blocked") or {}).get("until"))
-        say(args.account, f"BLOCKED ({why}); no more attempts until the password/key in SOPS changes" + (" or six hours pass" if why == "repeated" else ""))
-        return BLOCK_EXIT[why]
-    if verdict == "wait":
-        save_state(path, state)
-        write_status(status_path, args.account, "waiting", why=why)
-        say(args.account, f"login dead, waiting: {why}")
-        return 0
+    if args.enrol:
+        state["enrol_attempts"] = [t for t in state.get("enrol_attempts", []) if now - t < 86400]
+        if len(state["enrol_attempts"]) >= ENROL_MAX:
+            save_state(path, state)
+            write_status(status_path, args.account, "waiting", why="three enrolments in the last 24 hours")
+            say(args.account, "not enrolling: three enrolments in the last 24 hours")
+            return 0
+        state["blocked"] = None                        # a person asked for this: it lifts a code block
+        state["enrol_attempts"].append(now)
+    else:
+        if not state.get("enrolled"):
+            save_state(path, state)
+            write_status(status_path, args.account, "needs_enrolment")
+            say(args.account, "this device was never enrolled (no emailed code given yet); NOT trying the password. Start the enrol unit and send the code")
+            return EXIT_CODE
+        verdict, why = decide(state, now, secret)
+        if verdict == "blocked":
+            save_state(path, state)
+            write_status(status_path, args.account, "blocked_" + why, until=(state.get("blocked") or {}).get("until"))
+            say(args.account, f"BLOCKED ({why}); no more attempts until " + ("a person runs the enrol unit or the password/key in SOPS changes" if why == "code" else "the password/key in SOPS changes") + (" or six hours pass" if why == "repeated" else ""))
+            return BLOCK_EXIT[why]
+        if verdict == "wait":
+            save_state(path, state)
+            write_status(status_path, args.account, "waiting", why=why)
+            say(args.account, f"login dead, waiting: {why}")
+            return 0
 
     state.setdefault("attempts", []).append(now)
     save_state(path, state)                        # the attempt counts even if this process dies mid-login
@@ -229,11 +254,13 @@ def main(argv: list[str] | None = None) -> int:
         write_status(status_path, args.account, "awaiting_code", deadline=until)
         say(args.account, f"the portal wants the emailed code: waiting until {time.strftime('%H:%M:%S', time.gmtime(until))} UTC for submit_login_code")
 
-    status, session = run_login(user, password, key, args.timeout, say=lambda m: None,
-                                code_provider=lambda: take_code(code_file), code_wait=args.code_wait, on_code_page=on_code_page)
+    status, session = run_login(user, password, key, args.timeout, say=lambda m: None, profile=profile,
+                                code_provider=(lambda: take_code(code_file)) if args.enrol else None, code_wait=args.code_wait,
+                                on_code_page=on_code_page if args.enrol else None)
     password = ""                                   # noqa: F841
     if status == "ok":
         state["device_key"] = key                   # this device is registered: the next login needs only the password
+        state["enrolled"] = True
     if status == "ok" and session and deliver(session, args.auth_bin, store):
         again = asyncio.run(alive(args.port))
         if again:

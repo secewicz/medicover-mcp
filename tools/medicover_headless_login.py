@@ -158,13 +158,21 @@ def fill_and_submit(c: Cdp, user: str, password: str) -> None:
 
 
 def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=base.eprint,
-              code_provider=None, code_wait: int = 480, on_code_page=None) -> tuple[str, dict | None]:
-    """Log in once in a fresh headless Chrome. Returns (status, session): status is 'ok' (session = the JSON the server stores),
+              code_provider=None, code_wait: int = 480, on_code_page=None, profile: Path | None = None) -> tuple[str, dict | None]:
+    """Log in once in a headless Chrome: a fresh throw-away profile, or with `profile` a PERSISTENT one that keeps what the portal remembers
+    between runs (the 'trusted device' cookie set when the emailed code is typed with 'trust this device' ticked; a throw-away profile loses it,
+    which is why a password-only login kept asking for the code). Returns (status, session): status is 'ok' (session = the JSON the server stores),
     'code' (the portal asks for the emailed code), 'rejected' (the form came back after the submit: wrong password, or refused) or
     'timeout'. With a `code_provider` (a callable returning the six digits once they exist, else None) the emailed-code page is not the end:
     the browser stays open for up to `code_wait` seconds, types the code, ticks 'trust this device' and goes on; `on_code_page()` is called once
     when the page appears. Without one, or when no code arrives in time, the status is 'code'. Nothing secret is printed."""
-    tmp = Path(tempfile.mkdtemp(prefix="medicover-headless-"))
+    if profile is not None:
+        tmp = Path(profile)
+        tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for stale in tmp.glob("Singleton*"):          # a Chrome that was killed leaves these; the next start would refuse the profile
+            stale.unlink(missing_ok=True)
+    else:
+        tmp = Path(tempfile.mkdtemp(prefix="medicover-headless-"))
     chrome = launch(tmp, PORT, "about:blank")
     status, session = "timeout", None
     try:
@@ -228,8 +236,9 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
                     break
         c.close()
     finally:
-        base.close_chrome_port(chrome, PORT)
-        shutil.rmtree(tmp, ignore_errors=True)
+        base.close_chrome_port(chrome, PORT)             # a graceful close, so the profile's cookies reach the disk
+        if profile is None:
+            shutil.rmtree(tmp, ignore_errors=True)
     return status, session
 
 
@@ -245,6 +254,7 @@ def main() -> int:
     p.add_argument("--profile", default="~/.medicover-chrome", help="persistent profile to take the trusted device key from")
     p.add_argument("--device-key", help="use this device key instead of reading the profile")
     p.add_argument("--timeout", type=int, default=150)
+    p.add_argument("--keep-profile", metavar="DIR", help="keep this headless profile between runs (the way the hub's renewer does) instead of a throw-away one")
     p.add_argument("--ask-code", action="store_true", help="if the portal asks for the emailed code, ask for it here (it is typed with 'trust this device' ticked)")
     p.add_argument("--new-device", action="store_true", help="log in as a BRAND-NEW device (a fresh key, printed so you can reuse it with --device-key)")
     args = p.parse_args()
@@ -276,7 +286,8 @@ def main() -> int:
         return input("The portal e-mailed you a code. Type it here: ").strip() or None
 
     status, session = run_login(user, password, dk, args.timeout + (300 if args.ask_code else 0),
-                                code_provider=provider if args.ask_code else None)
+                                code_provider=provider if args.ask_code else None,
+                                profile=Path(args.keep_profile).expanduser() if args.keep_profile else None)
     password = ""   # noqa: F841
     messages = {"ok": "RESULT: signed in without the emailed code; a session exists.",
                 "code": "RESULT: the portal asks for the emailed code on this fresh profile and none was given (trust did not carry over).",
