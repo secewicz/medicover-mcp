@@ -191,3 +191,29 @@ def test_enrol_is_limited_to_three_a_day(tmp_path, monkeypatch):
 def test_every_login_uses_the_persistent_profile_next_to_the_state_file(tmp_path, monkeypatch):
     _, calls, _, _ = _run(tmp_path, monkeypatch, enrol=False, alive=False, state={"enrolled": True}, login=lambda kw: ("timeout", None))
     assert calls[0]["profile"] == tmp_path / "chrome"
+
+
+def test_a_successful_login_clears_the_daily_cap():
+    # the cap is on failures in a row: an account that logs in fine must not be locked out by its own history (27 Oct: an operator's tests used it up)
+    state = {"attempts": [1000.0 + i for i in range(6)], "failures": 2}
+    assert renew.decide(state, 1000.0 + 700, H)[0] == "wait"
+    renew.apply_result(state, "ok", 2000.0, H)
+    assert state["attempts"] == [] and state["failures"] == 0
+    assert renew.decide(state, 2001.0, H) == ("go", "")
+
+
+def test_the_host_lock_lets_one_login_run_at_a_time(tmp_path):
+    lock = str(tmp_path / "hub.lock")
+    first, got = renew.take_lock(lock, wait=1)
+    assert got and first is not None
+    second, got2 = renew.take_lock(lock, wait=0.2)          # another account while the first is still running Chrome
+    assert (second, got2) == (None, False)
+    first.close()
+    third, got3 = renew.take_lock(lock, wait=1)
+    assert got3 and third is not None
+    third.close()
+
+
+def test_no_lock_file_configured_means_no_lock():
+    assert renew.take_lock(None) == (None, True)
+    assert renew.take_lock("/nonexistent-dir/hub.lock") == (None, True)

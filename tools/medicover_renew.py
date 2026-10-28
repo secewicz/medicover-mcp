@@ -88,6 +88,31 @@ def save_state(path: Path, state: dict) -> None:
     os.replace(tmp, path)
 
 
+LOCK_WAIT = 900                # seconds one account waits for another account's login to finish
+
+
+def take_lock(path: str | None, wait: float = LOCK_WAIT):
+    """Holds a host-wide lock for as long as the returned file object lives, so two accounts never run Chrome at once (2 GB hub).
+    None path: no lock (tests, a laptop). Returns (file, True), or (None, False) when another login still runs after `wait`."""
+    if not path:
+        return None, True
+    import fcntl
+    try:
+        fh = open(path, "a")
+    except OSError:
+        return None, True                          # no lock file here: better a login than none
+    end = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh, True
+        except OSError:
+            if time.time() >= end:
+                fh.close()
+                return None, False
+            time.sleep(2)
+
+
 def decide(state: dict, now: float, secret: str) -> tuple[str, str]:
     """('blocked', reason) | ('wait', why) | ('go', ''). May edit state (lifting a block that no longer applies)."""
     blocked = state.get("blocked")
@@ -110,7 +135,7 @@ def decide(state: dict, now: float, secret: str) -> tuple[str, str]:
 
 def apply_result(state: dict, status: str, now: float, secret: str) -> None:
     if status == "ok":
-        state["failures"], state["blocked"] = 0, None
+        state["failures"], state["blocked"], state["attempts"] = 0, None, []     # the cap is on failures in a row: a login that works clears it
     elif status == "rejected":
         state["blocked"] = {"reason": "password", "secret": secret, "at": now}
     elif status in ("code", "code_rejected"):
@@ -204,8 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         say(args.account, "the instance is not reachable; nothing to renew")
         return 0
     if is_alive and not args.enrol:          # an enrolment logs in even when the session lives: its job is to register the device
-        if state.get("blocked") or state.get("failures"):
-            state["blocked"], state["failures"] = None, 0
+        if state.get("blocked") or state.get("failures") or state.get("attempts"):
+            state["blocked"], state["failures"], state["attempts"] = None, 0, []
             save_state(path, state)
         write_status(status_path, args.account, "ok")
         say(args.account, "login alive")
@@ -238,6 +263,12 @@ def main(argv: list[str] | None = None) -> int:
             say(args.account, f"login dead, waiting: {why}")
             return 0
 
+    lock, got = take_lock(os.environ.get("MEDICOVER_LOCK_FILE"))
+    if not got:
+        save_state(path, state)
+        write_status(status_path, args.account, "waiting", why="another account is logging in")
+        say(args.account, "login dead, waiting: another account is logging in")
+        return 0
     state.setdefault("attempts", []).append(now)
     save_state(path, state)                        # the attempt counts even if this process dies mid-login
     try:
