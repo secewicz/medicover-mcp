@@ -44,6 +44,7 @@ class Cdp:
     def __init__(self, ws_url: str):
         self.ws = connect(ws_url, max_size=2**23, open_timeout=5)
         self.n = 0
+        self.server_errors: list[str] = []      # '500 login-online24.medicover.pl/connect/token' for every 5xx a Medicover host answered
 
     def call(self, method: str, params: dict | None = None, timeout: float = 15):
         self.n += 1
@@ -53,7 +54,18 @@ class Cdp:
             msg = json.loads(self.ws.recv(timeout=max(0.1, end - time.monotonic())))
             if msg.get("id") == self.n:
                 return msg.get("result", {})
+            self.on_event(msg)
         raise TimeoutError(method)
+
+    def on_event(self, msg: dict) -> None:
+        """Network events arrive between the replies (after Network.enable). Keep only a Medicover host's 5xx: status, host and path, never the query."""
+        if msg.get("method") != "Network.responseReceived":
+            return
+        response = (msg.get("params") or {}).get("response") or {}
+        status = int(response.get("status") or 0)
+        url = urllib.parse.urlsplit(response.get("url") or "")
+        if status >= 500 and (url.hostname or "").endswith("medicover.pl"):
+            self.server_errors.append(f"{status} {url.hostname}{url.path}")
 
     def js(self, expression: str):
         return self.call("Runtime.evaluate", {"expression": expression, "returnByValue": True}).get("result", {}).get("value")
@@ -117,6 +129,26 @@ STAGE_JS = """(() => { const q = (s) => document.querySelector(s);
     login: !!q('input[name="Input.Password"]'), mfa: !!q('input[name="Input.MfaCode"]'),
     errors: (document.body.innerText || '').split('\\n').map(x => x.trim()).filter(x => x && x.length < 140 && /incorrect|oops|try again|invalid|error|nieprawid|b\u0142\u0105d|blocked|captcha|too many|locked|zablok/i.test(x)).slice(0,4)}); })()"""
 
+# The portal's own message under the form for a wrong login or password. Seen 26 Oct 2026, this tool with made-up credentials on the
+# portal's English pages: portal-says=['Incorrect data. Please try again.'] (it is not on the page before a submit). The browser asks for
+# English (ACCEPT_LANGUAGE below), so the words do not depend on the host's locale.
+CREDENTIAL_ERRORS = ("incorrect data",)
+ACCEPT_LANGUAGE = "en-US,en"
+
+
+def form_back_status(errors: list[str], server_errors: list[str]) -> str:
+    """What the login form coming back after the submit means.
+    'rejected' only when the portal SAYS the login or password is wrong (its own message, CREDENTIAL_ERRORS) and none of its hosts
+    answered with a server error since the submit: a caller treats it as final and must not retry the same password.
+    'portal_error' when a Medicover host answered 5xx since the submit (8 Nov 2026: login-online24 answered 500 for three minutes and
+    every account's form came back), even if the message shows: an outage makes the portal's words untrustworthy.
+    'form_back' when the form came back with neither: nothing says the password is wrong, so it is a plain failure, retried later."""
+    if server_errors:
+        return "portal_error"
+    if any(m in (e or "").lower() for e in errors for m in CREDENTIAL_ERRORS):
+        return "rejected"
+    return "form_back"
+
 
 def fill_code_and_submit(c: Cdp, code: str, say=base.eprint) -> None:
     """The emailed-code page: type the code, TICK 'trust this device' (so the next login from this device key needs only the password) and press
@@ -162,8 +194,9 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
     """Log in once in a headless Chrome: a fresh throw-away profile, or with `profile` a PERSISTENT one that keeps what the portal remembers
     between runs (the 'trusted device' cookie set when the emailed code is typed with 'trust this device' ticked; a throw-away profile loses it,
     which is why a password-only login kept asking for the code). Returns (status, session): status is 'ok' (session = the JSON the server stores),
-    'code' (the portal asks for the emailed code), 'rejected' (the form came back after the submit: wrong password, or refused) or
-    'timeout'. With a `code_provider` (a callable returning the six digits once they exist, else None) the emailed-code page is not the end:
+    'code' (the portal asks for the emailed code), 'rejected' (the form came back after the submit with the portal's wrong-credentials message),
+    'portal_error' (a Medicover host answered 5xx after the submit), 'form_back' (the form came back with no such message: not known to be the
+    password) or 'timeout'; see form_back_status. With a `code_provider` (a callable returning the six digits once they exist, else None) the emailed-code page is not the end:
     the browser stays open for up to `code_wait` seconds, types the code, ticks 'trust this device' and goes on; `on_code_page()` is called once
     when the page appears. Without one, or when no code arrives in time, the status is 'code'. Nothing secret is printed."""
     if profile is not None:
@@ -178,7 +211,7 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
     try:
         c = Cdp(page_ws(PORT, time.monotonic() + 20))
         c.call("Page.enable"); c.call("Network.enable")
-        c.call("Network.setUserAgentOverride", {"userAgent": HEADLESS_UA})
+        c.call("Network.setUserAgentOverride", {"userAgent": HEADLESS_UA, "acceptLanguage": ACCEPT_LANGUAGE})
         if dk:
             c.call("Page.addScriptToEvaluateOnNewDocument", {"source": f"if (location.origin === {json.dumps(SPA)} && !localStorage.getItem('deviceKey')) localStorage.setItem('deviceKey', {json.dumps(dk)});"})
         if profile is not None:
@@ -195,7 +228,7 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
                     continue
             say(f"[profile] stale portal tokens removed: {c.js(base.WIPE)}")
         c.call("Page.navigate", {"url": SPA + "/"})
-        submitted, last, back, deadline = False, None, 0, time.monotonic() + timeout
+        submitted, last, back, said, deadline = False, None, 0, set(), time.monotonic() + timeout
         announced, code_sent, code_deadline, mfa_after_code = False, False, None, 0
         while time.monotonic() < deadline:
             time.sleep(1.5)
@@ -232,21 +265,26 @@ def run_login(user: str, password: str, dk: str | None, timeout: int = 150, say=
                     break
                 continue
             if st.get("login") and not submitted:
+                c.server_errors.clear()              # only what answered the submit, or came after it, decides
                 fill_and_submit(c, user, password)
                 submitted = True
                 continue
             if st.get("login") and submitted:
                 back += 1
+                said.update(st.get("errors") or ())
                 if back >= 3:
-                    status = "rejected"
+                    status = form_back_status(sorted(said), c.server_errors)
+                    say(f"[form back] {status}: portal-says={sorted(said) or '-'}  server-errors={c.server_errors or '-'}")
                     break
             else:
-                back = 0
+                back, said = 0, set()
             if "online24.medicover.pl" == st.get("host") and not st.get("login"):
                 found = c.js(base.FIND)
                 if found:
                     status, session = "ok", json.loads(base.session_of_cdp(c, json.loads(found)["t"]))
                     break
+        if status == "timeout" and submitted and c.server_errors:
+            status = "portal_error"                  # no answer in time, and the portal was failing: name the cause
         c.close()
     finally:
         base.close_chrome_port(chrome, PORT)             # a graceful close, so the profile's cookies reach the disk
@@ -305,9 +343,11 @@ def main() -> int:
     messages = {"ok": "RESULT: signed in without the emailed code; a session exists.",
                 "code": "RESULT: the portal asks for the emailed code on this fresh profile and none was given (trust did not carry over).",
                 "code_rejected": "RESULT: a code was typed but the portal stayed on the code page (wrong or expired code, or the wrong button).",
-                "rejected": "RESULT: the login form came back after the submit (wrong credentials, or the portal did not let a headless browser through).",
+                "rejected": "RESULT: the login form came back with the portal's wrong-credentials message (wrong login or password).",
+                "portal_error": "RESULT: the portal answered with a server error (5xx) after the submit; an outage, not the password. Try later.",
+                "form_back": "RESULT: the login form came back without the portal's wrong-credentials message (an outage, or the portal did not let a headless browser through).",
                 "timeout": "RESULT: timed out before a session or a refusal."}
-    base.eprint(messages[status])
+    base.eprint(messages.get(status, f"RESULT: {status}"))
     if status != "ok":
         return {"code": 3, "code_rejected": 3, "rejected": 4}.get(status, 1)
     if args.dry:

@@ -15,12 +15,14 @@ scheduled run needs only the password, for as long as the portal keeps that trus
 SAFETY RULES, because a wrong password retried in a loop locks a real person out of their medical portal:
   * at most one browser login per 10 minutes and six per 24 hours;
   * a rejected password BLOCKS the account (no more attempts) until the password or device key in SOPS changes (the block remembers a hash
-    of them, never the values), or the login is delivered some other way and found alive;
+    of them, never the values), or the login is delivered some other way and found alive. 'Rejected' means the portal SAID so (its own
+    wrong-credentials message under the form). A form that comes back without that message, or a 5xx from the portal, is a plain failure
+    (below): on 8 Nov 2026 a three-minute portal outage blocked all three accounts as 'password' although no password was wrong;
   * a scheduled run is shown the emailed-code page: BLOCKED (the mail is already sent; nothing is retried) until `--enrol` runs or the password
     or device key in SOPS changes. An account that was never enrolled does not even try the password: it reports `needs_enrolment`;
   * `--enrol` waits (default 8 minutes) for the six digits (the MCP tool `submit_login_code` drops them in `pending-code.txt` next to the state
     file), at most 3 times in 24 hours; no code in time: blocked as above;
-  * three failures in a row (timeouts, crashes) block it for six hours.
+  * three failures in a row (timeouts, crashes, portal errors, a form back with no wrong-credentials message) block it for six hours.
 
 The device key it logs in with is, in this order: the one it remembered after its last success (`device_key` in the state), the one in SOPS,
 or a new one it makes up and remembers: the hub registers ITSELF as a trusted device.
@@ -134,13 +136,15 @@ def decide(state: dict, now: float, secret: str) -> tuple[str, str]:
 
 
 def apply_result(state: dict, status: str, now: float, secret: str) -> None:
+    """Record one browser login's status (run_login's). Only 'rejected', the portal's own wrong-credentials message, blocks for the password;
+    'portal_error', 'form_back', 'timeout' and anything else unknown are plain failures that count toward the six-hour block."""
     if status == "ok":
         state["failures"], state["blocked"], state["attempts"] = 0, None, []     # the cap is on failures in a row: a login that works clears it
     elif status == "rejected":
         state["blocked"] = {"reason": "password", "secret": secret, "at": now}
     elif status in ("code", "code_rejected"):
         state["blocked"] = {"reason": "code", "secret": secret, "at": now}      # no expiry: only a person (`--enrol`) or new SOPS values lift it
-    else:
+    else:                                                                       # transient: an outage must never become a permanent block
         state["failures"] = state.get("failures", 0) + 1
         if state["failures"] >= FAIL_BLOCK_AFTER:
             state["blocked"] = {"reason": "repeated", "until": now + FAIL_BLOCK_SECONDS, "at": now}

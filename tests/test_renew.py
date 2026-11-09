@@ -6,6 +6,8 @@ import json
 import stat
 from pathlib import Path
 
+import pytest
+
 spec = importlib.util.spec_from_file_location("medicover_renew", Path(__file__).resolve().parent.parent / "tools" / "medicover_renew.py")
 renew = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(renew)
@@ -217,3 +219,37 @@ def test_the_host_lock_lets_one_login_run_at_a_time(tmp_path):
 def test_no_lock_file_configured_means_no_lock():
     assert renew.take_lock(None) == (None, True)
     assert renew.take_lock("/nonexistent-dir/hub.lock") == (None, True)
+
+
+# --- a portal outage is not a wrong password (8 Nov 2026) ----------------------------------------------------------------------------
+# login-online24 answered 500 for about three minutes; the form came back for filip, tymon and julia, and each was blocked as 'password'
+# for good although no password was wrong. Only the portal's own wrong-credentials message ('rejected') may block for the password now.
+
+@pytest.mark.parametrize("status", ["portal_error", "form_back", "timeout", "something_new"])
+def test_a_failure_that_is_not_the_portals_wrong_password_message_never_blocks_for_the_password(status):
+    state = {}
+    renew.apply_result(state, status, 100.0, H)
+    assert not state.get("blocked") and state["failures"] == 1
+    renew.apply_result(state, status, 100.0, H)
+    renew.apply_result(state, status, 100.0, H)
+    assert state["blocked"]["reason"] == "repeated"                                  # three in a row: the six-hour block, not 'password'
+    assert state["blocked"]["until"] == 100.0 + renew.FAIL_BLOCK_SECONDS
+    assert renew.decide(state, 100.0 + renew.FAIL_BLOCK_SECONDS + 1, H)[0] == "go"   # and it lifts by itself
+
+
+def test_an_outage_then_a_working_login_leaves_nothing_behind():
+    state = {}
+    renew.apply_result(state, "portal_error", 100.0, H)
+    renew.apply_result(state, "ok", 800.0, H)
+    assert state["failures"] == 0 and state["blocked"] is None
+
+
+def test_a_scheduled_run_during_an_outage_exits_0_and_retries(tmp_path, monkeypatch):
+    code, calls, state, status = _run(tmp_path, monkeypatch, enrol=False, alive=False, state={"enrolled": True}, login=lambda kw: ("portal_error", None))
+    assert len(calls) == 1 and code == 0
+    assert not state.get("blocked") and state["failures"] == 1 and status["state"] == "failed"
+
+
+def test_the_portals_wrong_password_message_still_blocks_a_scheduled_run(tmp_path, monkeypatch):
+    code, calls, state, status = _run(tmp_path, monkeypatch, enrol=False, alive=False, state={"enrolled": True}, login=lambda kw: ("rejected", None))
+    assert code == renew.EXIT_PASSWORD and state["blocked"]["reason"] == "password" and status["state"] == "blocked_password"
