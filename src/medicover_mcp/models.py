@@ -125,6 +125,13 @@ class RescheduleResult(BaseModel):
     message: str | None = None
 
 
+class CancelResult(BaseModel):
+    cancelled: bool
+    status: str = Field(description="Success | NotPlanned (not among the patient's planned appointments: nothing was changed) | the portal's own status")
+    date: str | None = Field(default=None, description="Date of the appointment that was (or would have been) cancelled.")
+    message: str | None = None
+
+
 class FilterOptions(BaseModel):
     """Reference data for building a slot search (resolve names → opaque IDs)."""
 

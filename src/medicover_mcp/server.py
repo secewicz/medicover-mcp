@@ -357,6 +357,60 @@ async def reschedule_appointment(
         raise RuntimeError(_friendly(exc)) from exc
 
 
+@mcp.tool()
+async def cancel_appointment(
+    patient_id: Annotated[
+        int, Field(description="MRN of the patient. REQUIRED — never guessed.")
+    ],
+    appointment_id: Annotated[
+        str, Field(description="The `appointment_id` of the PLANNED appointment to cancel (from list_appointments).")
+    ],
+    confirm: Annotated[
+        bool,
+        Field(description="Must be true to actually cancel. Leave false until the person has asked for "
+                          "this exact cancellation, or it falls inside a standing instruction they wrote."),
+    ] = False,
+) -> models.CancelResult:
+    """Cancel one planned appointment, by its exact `appointment_id`; it never picks one itself.
+
+    Read-before-write: the appointment must be among this patient's planned appointments and the
+    portal must say it can be cancelled; otherwise nothing is changed and the reason is returned
+    (cancelling an appointment that is already gone is a plain `NotPlanned` result, not an error).
+    Afterwards read `list_appointments` to see what the portal now shows.
+    """
+    _require_confirmation("cancel_appointment", confirm, "cancels a real medical appointment")
+    client = _get_client()
+    try:
+        planned = await client.list_appointments(patient_id, "Planned")
+        current = next((a for a in planned if a.get("id") == appointment_id), None)
+        if current is None:
+            return models.CancelResult(
+                cancelled=False,
+                status="NotPlanned",
+                message="appointment_id is not among this patient's planned appointments; nothing was changed",
+            )
+        date = current.get("date")
+        if not (current.get("attributes") or {}).get("canCancel"):
+            return models.CancelResult(
+                cancelled=False,
+                status="NotCancellable",
+                date=date,
+                message="the portal does not allow cancelling this appointment; nothing was changed",
+            )
+        result = await client.cancel_appointment(patient_id, encoded_appointment_id=appointment_id)
+        status = (result or {}).get("status", "Success") if isinstance(result, dict) else "Success"
+        return models.CancelResult(
+            cancelled=str(status).lower() == "success",
+            status=str(status),
+            date=date,
+            message=(result or {}).get("message") if isinstance(result, dict) else None,
+        )
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(_friendly(exc)) from exc
+
+
 # --- login hand-off (fork change): the hub's renewer may stop at the portal's emailed-code page -----------------------------
 
 _LOGIN_MESSAGES = {
