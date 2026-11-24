@@ -301,8 +301,9 @@ class MedicoverClient:
     async def cancel_appointment(self, patient_id: int, *, encoded_appointment_id: str) -> dict:
         """Cancel an appointment by its encoded `id` (from list_appointments).
 
-        Intentionally NOT exposed as an MCP tool (no cancel-without-rebook in the agent
-        surface); it exists so test/probe code can guarantee cleanup after a booking.
+        Exposed as the `cancel_appointment` MCP tool behind the same confirm gate as the other
+        writes (the household wants Hermes to cancel on request); the server checks the
+        appointment first.
         """
         import urllib.parse
 

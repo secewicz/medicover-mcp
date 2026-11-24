@@ -13,7 +13,9 @@ from medicover_mcp import server
 class FakeClient:
     def __init__(self):
         self.reschedule_called = False
-        self.planned = [{"id": "APPT-1", "date": "2026-06-20T10:00:00", "state": "Planned"}]
+        self.cancel_called = []
+        self.planned = [{"id": "APPT-1", "date": "2026-06-20T10:00:00", "state": "Planned",
+                         "attributes": {"canCancel": True}}]
 
     async def list_appointments(self, patient_id, state, specialty_id=None):
         return self.planned
@@ -24,6 +26,10 @@ class FakeClient:
 
     async def book_appointment(self, patient_id, *, booking_string, reporting_id=""):
         return {"appointmentId": 999}
+
+    async def cancel_appointment(self, patient_id, *, encoded_appointment_id):
+        self.cancel_called.append((patient_id, encoded_appointment_id))
+        return {"status": "Success"}
 
     async def search_slots(self, patient_id, **kwargs):
         self.search_kwargs = kwargs
@@ -118,6 +124,43 @@ async def test_reschedule_without_confirm_is_refused_and_does_not_call(fake_clie
     assert fake_client.reschedule_called is False
 
 
+async def test_cancel_without_confirm_is_refused_and_does_not_call(fake_client):
+    for kwargs in ({}, {"confirm": False}):
+        with pytest.raises(RuntimeError, match="CONFIRMATION REQUIRED"):
+            await server.cancel_appointment(patient_id=2220055, appointment_id="APPT-1", **kwargs)
+    assert fake_client.cancel_called == []
+
+
+async def test_cancel_cancels_the_named_planned_appointment(fake_client):
+    result = await server.cancel_appointment(patient_id=2220055, appointment_id="APPT-1", confirm=True)
+    assert result.cancelled is True and result.date == "2026-06-20T10:00:00"
+    assert fake_client.cancel_called == [(2220055, "APPT-1")]
+
+
+async def test_cancel_unknown_or_gone_appointment_changes_nothing(fake_client):
+    result = await server.cancel_appointment(patient_id=2220055, appointment_id="NOPE", confirm=True)
+    assert result.cancelled is False and result.status == "NotPlanned"
+    fake_client.planned = []
+    result = await server.cancel_appointment(patient_id=2220055, appointment_id="APPT-1", confirm=True)
+    assert result.status == "NotPlanned"
+    assert fake_client.cancel_called == []
+
+
+async def test_cancel_refuses_what_the_portal_says_cannot_be_cancelled(fake_client):
+    fake_client.planned[0]["attributes"] = {"canCancel": False}
+    result = await server.cancel_appointment(patient_id=2220055, appointment_id="APPT-1", confirm=True)
+    assert result.cancelled is False and result.status == "NotCancellable"
+    assert fake_client.cancel_called == []
+
+
+async def test_cancel_portal_failure_is_an_error_not_a_success(fake_client, monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("portal said no")
+    monkeypatch.setattr(fake_client, "cancel_appointment", boom)
+    with pytest.raises(RuntimeError, match="portal said no"):
+        await server.cancel_appointment(patient_id=2220055, appointment_id="APPT-1", confirm=True)
+
+
 async def test_search_slots_end_date_filters_client_side(fake_client):
     result = await server.search_slots(
         region_ids=["204"], specialty_ids=["9"],
@@ -140,7 +183,7 @@ async def test_read_tools_are_hinted_read_only_and_writes_are_not():
     tools = {t.name: t for t in await server.mcp.list_tools()}
     reads = {"list_patients", "list_appointments", "list_appointment_filters",
              "list_search_filters", "search_slots", "login_status"}
-    writes = {"book_appointment", "reschedule_appointment", "submit_login_code"}
+    writes = {"book_appointment", "reschedule_appointment", "cancel_appointment", "submit_login_code"}
     assert set(tools) == reads | writes
     for name in reads:
         assert tools[name].annotations is not None and tools[name].annotations.readOnlyHint is True
